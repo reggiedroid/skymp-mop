@@ -9,13 +9,12 @@ using namespace MpParallel;
 namespace {
 
 ActorSnapshot MakeActor(uint32_t formId, uint32_t worldOrCell, int16_t chunkX,
-                        int16_t chunkY, uint32_t relayCount = 0)
+                        int16_t chunkY)
 {
   ActorSnapshot actor;
   actor.formId = formId;
   actor.worldOrCell = worldOrCell;
   actor.area = AreaKey{ worldOrCell, chunkX, chunkY };
-  actor.relayCount = relayCount;
   return actor;
 }
 
@@ -183,7 +182,7 @@ TEST_CASE("Member lists are ascending and cover every actor",
   for (int16_t i = 0; i < 40; ++i) {
     actors.push_back(MakeActor(static_cast<uint32_t>(i + 1), 0x3c,
                                static_cast<int16_t>((i % 5) * 30),
-                               static_cast<int16_t>(i / 5), 2));
+                               static_cast<int16_t>(i / 5)));
   }
 
   std::vector<AreaCluster> clusters;
@@ -200,7 +199,6 @@ TEST_CASE("Member lists are ascending and cover every actor",
       REQUIRE(actors[actorIndex].clusterIndex ==
               static_cast<uint32_t>(&cluster - clusters.data()));
     }
-    REQUIRE(cluster.relayEdgeCount == cluster.Size() * 2);
   }
 
   REQUIRE(covered == actors.size());

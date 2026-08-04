@@ -23,7 +23,7 @@ struct AreaCluster
 
   // Sum of relayCount over the members: the quantity the parallel phase
   // actually scales with, and therefore the basis of the cost estimate.
-  uint64_t relayEdgeCount = 0;
+
 
   [[nodiscard]] size_t Size() const noexcept { return actorIndices.size(); }
 };

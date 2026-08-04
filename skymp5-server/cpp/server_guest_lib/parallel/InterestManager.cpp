@@ -124,21 +124,32 @@ void ProcessRange(const TickSnapshot& snapshot, const uint32_t* actorIndices,
     // The relay happens before validation on the inline path, so a rejected
     // update is still forwarded to neighbours. Preserving that ordering
     // keeps observable behaviour identical.
-    if (actor.relayCount == 0 || actor.packetLength == 0) {
+    if (actor.packetLength == 0) {
       continue;
     }
 
-    const uint32_t relayEnd = actor.relayBegin + actor.relayCount;
-    if (relayEnd > snapshot.relayTargets.size()) {
-      continue;
-    }
+    for (int32_t dy = -1; dy <= 1; ++dy) {
+      for (int32_t dx = -1; dx <= 1; ++dx) {
+        RelayTarget dummyTarget;
+        dummyTarget.worldOrCell = actor.worldOrCell;
+        dummyTarget.chunkX = static_cast<int16_t>(actor.area.chunkX) + dx;
+        dummyTarget.chunkY = static_cast<int16_t>(actor.area.chunkY) + dy;
 
-    for (uint32_t relayIndex = actor.relayBegin; relayIndex < relayEnd;
-         ++relayIndex) {
-      const RelayTarget& target = snapshot.relayTargets[relayIndex];
-      if (target.userId == Networking::InvalidUserId) {
-        continue;
-      }
+        auto comp = [](const RelayTarget& a, const RelayTarget& b) {
+          if (a.worldOrCell != b.worldOrCell) return a.worldOrCell < b.worldOrCell;
+          if (a.chunkX != b.chunkX) return a.chunkX < b.chunkX;
+          return a.chunkY < b.chunkY;
+        };
+
+        auto range = std::equal_range(snapshot.relayTargets.begin(),
+                                      snapshot.relayTargets.end(),
+                                      dummyTarget, comp);
+
+        for (auto it = range.first; it != range.second; ++it) {
+          const RelayTarget& target = *it;
+          if (target.userId == Networking::InvalidUserId) {
+            continue;
+          }
 
       const float sqrDistance = SqrDistance(actor.currentPos, target.pos);
       const uint32_t skipFactor =
@@ -159,6 +170,8 @@ void ProcessRange(const TickSnapshot& snapshot, const uint32_t* actorIndices,
       send.reliable = false;
       output.sends.push_back(send);
       ++output.emittedEdges;
+        }
+      }
     }
   }
 }

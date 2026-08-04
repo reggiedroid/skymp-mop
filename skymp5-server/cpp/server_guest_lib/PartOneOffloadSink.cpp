@@ -69,3 +69,15 @@ void PartOneOffloadSink::SendRelay(Networking::UserId userId,
   partOne.GetSendTarget().Send(
     userId, reinterpret_cast<Networking::PacketData>(data), length, reliable);
 }
+
+void PartOneOffloadSink::SendRelayList(Networking::UserId userId,
+                                       const Networking::PacketData* dataArray,
+                                       const size_t* lengths, size_t count,
+                                       bool reliable)
+{
+  if (!partOne.IsConnected(userId)) {
+    return;
+  }
+
+  partOne.GetSendTarget().SendList(userId, dataArray, lengths, count, reliable);
+}

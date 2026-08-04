@@ -70,6 +70,16 @@ public:
 
   virtual void SendRelay(Networking::UserId userId, const uint8_t* data,
                          size_t length, bool reliable) = 0;
+
+  virtual void SendRelayList(Networking::UserId userId,
+                             const Networking::PacketData* dataArray,
+                             const size_t* lengths, size_t count,
+                             bool reliable)
+  {
+    for (size_t i = 0; i < count; ++i) {
+      SendRelay(userId, dataArray[i], lengths[i], reliable);
+    }
+  }
 };
 
 // Collects movement updates during packet ingest, processes them across the

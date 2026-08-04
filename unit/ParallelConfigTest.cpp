@@ -115,12 +115,10 @@ TEST_CASE("An unmeasured area is estimated from its relay load",
   AreaCluster small;
   small.representative = AreaKey{ 0x3c, 0, 0 };
   small.actorIndices.assign(2, 0);
-  small.relayEdgeCount = 4;
 
   AreaCluster large;
   large.representative = AreaKey{ 0x3c, 50, 50 };
   large.actorIndices.assign(40, 0);
-  large.relayEdgeCount = 1600;
 
   REQUIRE(balancer.EstimateMicros(large) > balancer.EstimateMicros(small));
 }
@@ -133,7 +131,6 @@ TEST_CASE("Measurements override the cold-start estimate",
   AreaCluster cluster;
   cluster.representative = AreaKey{ 0x3c, 1, 1 };
   cluster.actorIndices.assign(1, 0);
-  cluster.relayEdgeCount = 1;
 
   // Repeated identical samples must converge on the observed value.
   for (int i = 0; i < 40; ++i) {

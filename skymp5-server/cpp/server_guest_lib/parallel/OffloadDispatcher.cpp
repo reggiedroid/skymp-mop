@@ -136,21 +136,24 @@ bool OffloadDispatcher::SubmitMovement(const MovementSubmission& submission)
                                  submission.packetData,
                                  submission.packetData + submission.packetLength);
 
-  actor.relayBegin = static_cast<uint32_t>(snapshot.relayTargets.size());
-  if (submission.relayTargets != nullptr && submission.relayTargetCount > 0) {
-    actor.relayCount = static_cast<uint32_t>(submission.relayTargetCount);
-    snapshot.relayTargets.insert(
-      snapshot.relayTargets.end(), submission.relayTargets,
-      submission.relayTargets + submission.relayTargetCount);
-  } else {
-    // A count without a pointer would otherwise describe a range that was
-    // never appended.
-    actor.relayCount = 0;
-  }
-
   actor.clusterIndex = kUnassignedCluster;
   snapshot.actors.push_back(actor);
   return true;
+}
+
+void OffloadDispatcher::SetPotentialTargets(std::vector<RelayTarget>&& targets)
+{
+  snapshot.relayTargets = std::move(targets);
+  std::sort(snapshot.relayTargets.begin(), snapshot.relayTargets.end(),
+            [](const RelayTarget& a, const RelayTarget& b) {
+              if (a.worldOrCell != b.worldOrCell) {
+                return a.worldOrCell < b.worldOrCell;
+              }
+              if (a.chunkX != b.chunkX) {
+                return a.chunkX < b.chunkX;
+              }
+              return a.chunkY < b.chunkY;
+            });
 }
 
 void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
@@ -278,7 +281,6 @@ void OffloadDispatcher::RunUnits()
          ++i) {
       snapshot.actors[i].clusterIndex = 0;
       single.actorIndices.push_back(i);
-      single.relayEdgeCount += snapshot.actors[i].relayCount;
     }
     metrics.lastChunkCount = 1;
     ++metrics.totalInlineTicks;
@@ -400,6 +402,13 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
 
   clusterMicros.assign(clusters.size(), 0);
 
+  std::vector<OutboundSend> allSends;
+  size_t totalSends = 0;
+  for (const ClusterOutput& output : unitOutputs) {
+    totalSends += output.sends.size();
+  }
+  allSends.reserve(totalSends);
+
   // Work-unit order: cluster index, then ascending member order within the
   // cluster. Both are fixed before any task starts, so the same inputs
   // produce the same sequence of world writes no matter how many cores ran
@@ -414,9 +423,7 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
             snapshot.rawPacketBytes.size()) {
         continue;
       }
-      sink.SendRelay(send.userId,
-                     snapshot.rawPacketBytes.data() + send.byteOffset,
-                     send.byteLength, send.reliable);
+      allSends.push_back(send);
     }
 
     for (const MovementVerdict& verdict : output.verdicts) {
@@ -442,6 +449,34 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
     if (unit.clusterIndex < clusterMicros.size()) {
       clusterMicros[unit.clusterIndex] += output.elapsedMicros;
     }
+  }
+
+  std::sort(allSends.begin(), allSends.end(), [](const OutboundSend& a, const OutboundSend& b) {
+    if (a.userId != b.userId) return a.userId < b.userId;
+    return a.reliable < b.reliable;
+  });
+
+  std::vector<Networking::PacketData> batchData;
+  std::vector<size_t> batchLengths;
+  batchData.reserve(32);
+  batchLengths.reserve(32);
+
+  size_t i = 0;
+  while (i < allSends.size()) {
+    Networking::UserId currentUserId = allSends[i].userId;
+    bool currentReliable = allSends[i].reliable;
+    batchData.clear();
+    batchLengths.clear();
+
+    size_t j = i;
+    while (j < allSends.size() && allSends[j].userId == currentUserId && allSends[j].reliable == currentReliable) {
+      batchData.push_back(snapshot.rawPacketBytes.data() + allSends[j].byteOffset);
+      batchLengths.push_back(allSends[j].byteLength);
+      ++j;
+    }
+
+    sink.SendRelayList(currentUserId, batchData.data(), batchLengths.data(), batchData.size(), currentReliable);
+    i = j;
   }
 
   // Cost is tracked per area, so a cluster's shards are summed back together

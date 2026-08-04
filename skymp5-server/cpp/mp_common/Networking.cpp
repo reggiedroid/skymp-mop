@@ -181,6 +181,31 @@ public:
                reliable ? RELIABLE_ORDERED : UNRELIABLE, 0, guid, false);
   }
 
+  void SendList(Networking::UserId id, const Networking::PacketData* dataArray,
+                const size_t* lengths, size_t count, bool reliable) override
+  {
+    const auto guid = idManager->find(id);
+    if (guid == RakNetGUID(-1)) {
+      throw std::runtime_error("User with id " + std::to_string(id) +
+                               " doesn't exist");
+    }
+
+    // Allocate arrays on stack if count is small enough, else heap allocation.
+    // In our offload context, count might be large but usually under a few hundred.
+    std::vector<const char*> charDataArray;
+    charDataArray.reserve(count);
+    std::vector<int> intLengthsArray;
+    intLengthsArray.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      charDataArray.push_back(reinterpret_cast<const char*>(dataArray[i]));
+      intLengthsArray.push_back(static_cast<int>(lengths[i]));
+    }
+
+    peer->SendList(charDataArray.data(), intLengthsArray.data(),
+                   static_cast<int>(count), MEDIUM_PRIORITY,
+                   reliable ? RELIABLE_ORDERED : UNRELIABLE, 0, guid, false);
+  }
+
   void Tick(OnPacket onPacket, void* state) override
   {
     while (1) {
