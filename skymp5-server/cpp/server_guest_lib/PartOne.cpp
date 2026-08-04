@@ -18,8 +18,8 @@
 #include "OpenSSLSigner.h"
 #include "PacketParser.h"
 #include "PartOneOffloadSink.h"
+#include "parallel/AreaKey.h"
 #include "parallel/OffloadDispatcher.h"
-
 PartOneSendTargetWrapper::PartOneSendTargetWrapper(
   Networking::ISendTarget& underlyingSendTarget_)
   : underlyingSendTarget(underlyingSendTarget_)
@@ -163,6 +163,32 @@ void PartOne::Tick()
   // tick's packet pump lands before timers get a chance to act on positions,
   // which is the order the inline path produced.
   if (pImpl->offloadDispatcher && pImpl->offloadSink) {
+    std::vector<MpParallel::RelayTarget> potentialTargets;
+    for (size_t i = 0, n = serverState.maxConnectedId; i <= n; ++i) {
+      Networking::UserId userId = static_cast<Networking::UserId>(i);
+      if (serverState.IsConnected(userId)) {
+        MpActor* actor = serverState.ActorByUser(userId);
+        if (actor) {
+          try {
+            auto worldOrCell = actor->GetCellOrWorld().ToFormId(worldState.espmFiles);
+            MpParallel::RelayTarget target;
+            target.userId = userId;
+            target.listenerFormId = actor->GetFormId();
+            target.worldOrCell = worldOrCell;
+            auto pos = actor->GetPos();
+            target.pos[0] = pos.x;
+            target.pos[1] = pos.y;
+            target.pos[2] = pos.z;
+            target.chunkX = MpParallel::ToChunkCoord(pos.x);
+            target.chunkY = MpParallel::ToChunkCoord(pos.y);
+            potentialTargets.push_back(target);
+          } catch (const std::exception&) {
+            // Ignore actors with invalid cell/world
+          }
+        }
+      }
+    }
+    pImpl->offloadDispatcher->SetPotentialTargets(std::move(potentialTargets));
     pImpl->offloadDispatcher->ExecuteTick(*pImpl->offloadSink);
   }
 

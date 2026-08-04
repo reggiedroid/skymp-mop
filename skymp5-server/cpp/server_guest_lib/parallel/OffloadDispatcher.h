@@ -41,10 +41,7 @@ struct MovementSubmission
   const uint8_t* packetData = nullptr;
   size_t packetLength = 0;
 
-  // Actors that can currently see this one, already resolved to connected
-  // users by the caller.
-  const RelayTarget* relayTargets = nullptr;
-  size_t relayTargetCount = 0;
+
 };
 
 // The main-thread effects the join phase has to perform. Splitting them

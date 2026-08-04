@@ -142,9 +142,6 @@ private:
 
   PartOne& partOne;
 
-  // Reused across submissions so resolving recipients does not allocate on
-  // the hot path.
-  std::vector<MpParallel::RelayTarget> relayTargetScratch;
 
   // TODO: inverse dependency
   std::shared_ptr<CraftService> craftService;

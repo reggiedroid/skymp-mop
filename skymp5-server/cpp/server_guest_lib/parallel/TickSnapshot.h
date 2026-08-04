@@ -52,10 +52,6 @@ struct ActorSnapshot
   // Chunk of `currentPos`, i.e. the chunk this actor is partitioned by.
   AreaKey area;
 
-  // Half-open range into TickSnapshot::relayTargets.
-  uint32_t relayBegin = 0;
-  uint32_t relayCount = 0;
-
   // Half-open range into TickSnapshot::rawPacketBytes holding the packet that
   // has to be relayed verbatim to the recipients.
   uint32_t packetOffset = 0;
