@@ -17,6 +17,8 @@
 #include "MessageSerializerFactory.h"
 #include "OpenSSLSigner.h"
 #include "PacketParser.h"
+#include "PartOneOffloadSink.h"
+#include "parallel/OffloadDispatcher.h"
 
 PartOneSendTargetWrapper::PartOneSendTargetWrapper(
   Networking::ISendTarget& underlyingSendTarget_)
@@ -96,6 +98,10 @@ struct PartOne::Impl
   bool enableGamemodeDataUpdatesBroadcast = false;
 
   PartOne::OnActorStreamIn onActorStreamIn;
+
+  // Always present, but does nothing until ConfigureParallelism turns it on.
+  std::unique_ptr<MpParallel::OffloadDispatcher> offloadDispatcher;
+  std::unique_ptr<PartOneOffloadSink> offloadSink;
 };
 
 PartOne::PartOne(Networking::ISendTarget* sendTarget)
@@ -114,6 +120,12 @@ PartOne::PartOne(std::shared_ptr<Listener> listener,
 
 PartOne::~PartOne()
 {
+  // Drop anything submitted but not yet joined before the actors it refers to
+  // go away, and stop the workers while the world is still intact.
+  if (pImpl && pImpl->offloadDispatcher) {
+    pImpl->offloadDispatcher->DiscardPending();
+  }
+
   // worldState may depend on serverState (actorsMap), we should reset it first
   worldState.Clear();
   serverState = {};
@@ -146,8 +158,32 @@ bool PartOne::IsConnected(Networking::UserId userId) const
 void PartOne::Tick()
 {
   TickPacketHistoryPlaybacks();
+
+  // Runs before worldState.Tick so that movement submitted during this
+  // tick's packet pump lands before timers get a chance to act on positions,
+  // which is the order the inline path produced.
+  if (pImpl->offloadDispatcher && pImpl->offloadSink) {
+    pImpl->offloadDispatcher->ExecuteTick(*pImpl->offloadSink);
+  }
+
   TickDeferredMessages();
   worldState.Tick();
+}
+
+MpParallel::OffloadDispatcher& PartOne::GetOffloadDispatcher()
+{
+  return *pImpl->offloadDispatcher;
+}
+
+void PartOne::ConfigureParallelism(const MpParallel::ParallelConfig& config)
+{
+  pImpl->offloadDispatcher->Reconfigure(config);
+  GetLogger().info("{}", pImpl->offloadDispatcher->GetConfig().Describe());
+}
+
+const MpParallel::ParallelMetrics& PartOne::GetParallelMetrics() const
+{
+  return pImpl->offloadDispatcher->GetMetrics();
 }
 
 uint32_t PartOne::CreateActor(uint32_t formId, const NiPoint3& pos,
@@ -755,6 +791,13 @@ void PartOne::Init()
 {
   pImpl.reset(new Impl);
   pImpl->logger.reset(new spdlog::logger{ "empty logger" });
+
+  // Constructed disabled, so no threads exist until a server config asks for
+  // them. Tests and embedders that never call ConfigureParallelism keep the
+  // original single-threaded behaviour byte for byte.
+  pImpl->offloadDispatcher =
+    std::make_unique<MpParallel::OffloadDispatcher>(MpParallel::ParallelConfig{});
+  pImpl->offloadSink = std::make_unique<PartOneOffloadSink>(*this);
 
   pImpl->onSubscribe = [this](PartOneSendTargetWrapper* sendTarget,
                               MpObjectReference* emitter,
