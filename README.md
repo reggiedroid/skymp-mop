@@ -13,6 +13,22 @@ This framework spreads that per-area work across the cores the server host
 actually has. It is **off by default**; a server that does not opt in behaves
 exactly as it did before.
 
+A fork of [SkyMP](https://github.com/skyrim-multiplayer/skymp) carrying
+server-side optimizations, intended to be proposed upstream rather than to
+diverge from it.
+
+| | |
+| --- | --- |
+| Crowded-area tick | **1.39×** — 400 players, measured |
+| Legacy JSON ingest | **3.4–6.3×** — closes upstream `TODO(#2257)` |
+| Hang bugs fixed | 1 tick-stopping race |
+| Tests | 480,346 assertions · 310 cases · 12/12 ctest |
+| Risk if unused | 0 — off by default |
+
+Jump to: [what it costs, measured](#what-it-actually-costs-measured) ·
+[interest management](#interest-management--the-part-that-actually-pays) ·
+[configuration](#configuration) · [build & terms](#building)
+
 ## What actually gets parallelised
 
 Movement is the dominant packet by volume, and its cost is not linear in player
@@ -80,6 +96,7 @@ So the scheduling unit is a *shard*: a contiguous slice of one cluster's
 members. Each sender's work depends only on the immutable snapshot, so any
 split of a cluster's members is safe; the cluster boundary is what makes
 throttling and recipient sets coherent, not what makes the work independent.
+
 ### What it actually costs, measured
 
 An earlier version of this document quoted modelled speedups of 4×/8×/15×
@@ -351,3 +368,46 @@ Two suites are worth knowing about specifically:
 - `[ParallelOffload]` asserts that sharding is behaviour-neutral: the same
   population processed as one unit and as sixteen produces byte-identical
   relay sequences, in the same order.
+
+---
+
+## Building
+
+Prerequisites and build instructions are unchanged from upstream — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+```bash
+cmake --build .                  # from inside your build directory
+ctest -C Release                 # 12/12
+./unit/unit "[ParallelBench]"    # the measurements above, on your hardware
+./unit/unit "[ParallelOffload]"  # dispatcher, parity, sharding, interest mgmt
+```
+
+## Further reading
+
+| | |
+| --- | --- |
+| [MOP.md](MOP.md) | The pitch: what it does, the numbers, and what it does not claim |
+| [docs/docs_parallel_area_offload.md](docs/docs_parallel_area_offload.md) | Design notes and full config reference |
+| [PULL_REQUEST.md](PULL_REQUEST.md) | Proposal writeup for upstream |
+
+## About the parent project
+
+SkyMP is an open-source multiplayer mod for Skyrim, built on top of
+[SkyrimPlatform](docs/docs_skyrim_platform.md) — a tool for writing Skyrim mods
+in TypeScript and Chromium.
+
+[![Discord Chat](https://img.shields.io/discord/699653182946803722?label=Discord&logo=Discord)](https://discord.gg/k39uQ9Yudt)
+[![Players](https://skymp-badges.vercel.app/badges/players_online.svg)](https://discord.gg/k39uQ9Yudt)
+[![Servers](https://skymp-badges.vercel.app/badges/servers_online.svg)](https://discord.gg/k39uQ9Yudt)
+
+All credit for SkyMP itself belongs to the
+[upstream project and its contributors](https://github.com/skyrim-multiplayer/skymp/graphs/contributors).
+
+### Terms of Use
+
+See [TERMS.md](TERMS.md). **TL;DR: disclose the source code of your forks.**
+
+Third-party code licenses are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+Contributing upstream requires accepting their Contributor Assignment
+Agreement — see [CLA.md](CLA.md).
