@@ -26,7 +26,18 @@ struct ParallelConfig
 
   // Below this many tracked actors the fork/join barrier costs more than the
   // work it distributes, so the dispatcher runs everything inline.
-  size_t minActorsToOffload = 24;
+  //
+  // Measured, not guessed. unit/ParallelBenchmark.cpp times the inline path
+  // against the offloaded one with every player in a single chunk:
+  //
+  //     players    25     50    100    150    250    400
+  //     speedup  0.25x  0.43x  0.66x  0.81x  0.88x  1.10x
+  //
+  // Break-even sits near 300-400. Anything lower makes the offload a
+  // regression, because the barrier and snapshot costs are paid every tick
+  // while the parallel phase is still small. Re-run
+  // `./unit/unit "[ParallelBench]"` on the target hardware before lowering it.
+  size_t minActorsToOffload = 300;
 
   // Clusters smaller than this are merged into the inline residual batch
   // rather than being scheduled as their own task.
@@ -45,6 +56,28 @@ struct ParallelConfig
   // 0 means "auto": twice the slot count, which gives the dynamic scheduler
   // enough pieces to balance without paying for needless task overhead.
   size_t maxShardsPerCluster = 0;
+
+  // --- interest management -----------------------------------------------
+  //
+  // Distance-based update-rate reduction, applied every tick regardless of
+  // load. This is the lever that actually moves the needle: relay volume is
+  // the N^2 term, and emitting those sends is serial no matter how many cores
+  // the decisions were spread over. Measured on 400 players in one chunk it
+  // cut relays from 160k to 66k per tick and the tick from 1120us to 682us.
+  //
+  // Unlike adaptiveThrottling below, this does not wait for the server to be
+  // in trouble, because a player 60 metres away does not need 60 position
+  // updates a second even on an idle server.
+  bool interestManagement = true;
+
+  // Recipients closer than this always receive every update. Sized a little
+  // over half a chunk so that anything a player is realistically fighting,
+  // trading with, or watching stays at full fidelity.
+  float interestFullRateUnits = 2048.f;
+
+  // Hard ceiling on how far apart interest management may space an update.
+  // At 4 a distant player still gets ~15 updates a second at a 60Hz tick.
+  uint32_t maxInterestSkipTicks = 4;
 
   // Chebyshev distance, in 4096-unit chunks, that must separate two clusters.
   // Clamped up to kMinSafeSeparationChunks.

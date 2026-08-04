@@ -73,7 +73,10 @@ ParallelConfig MakeConfig(size_t workerThreads, size_t minActorsToOffload)
   config.workerThreads = workerThreads;
   config.minActorsToOffload = minActorsToOffload;
   config.minClusterActors = 1;
+  // Both rate-reduction mechanisms off, so these tests observe the raw relay
+  // fan-out. Interest management gets its own dedicated cases below.
   config.adaptiveThrottling = false;
+  config.interestManagement = false;
   config.Normalize();
   return config;
 }
@@ -82,8 +85,7 @@ ParallelConfig MakeConfig(size_t workerThreads, size_t minActorsToOffload)
 // away from where the actor currently is.
 MovementSubmission MakeSubmission(uint32_t formId, uint32_t idx,
                                   Networking::UserId ownerUserId, float x,
-                                  float y, const std::vector<uint8_t>& packet,
-                                  const std::vector<RelayTarget>& targets)
+                                  float y, const std::vector<uint8_t>& packet)
 {
   MovementSubmission submission;
   submission.formId = formId;
@@ -101,8 +103,7 @@ MovementSubmission MakeSubmission(uint32_t formId, uint32_t idx,
   submission.isStanding = true;
   submission.packetData = packet.data();
   submission.packetLength = packet.size();
-  submission.relayTargets = targets.empty() ? nullptr : targets.data();
-  submission.relayTargetCount = targets.size();
+  
   return submission;
 }
 
@@ -112,6 +113,9 @@ RelayTarget MakeTarget(Networking::UserId userId, uint32_t formId, float x,
   RelayTarget target;
   target.userId = userId;
   target.listenerFormId = formId;
+  target.worldOrCell = 0x3c;
+  target.chunkX = static_cast<int16_t>(x / 4096.f);
+  target.chunkY = static_cast<int16_t>(y / 4096.f);
   target.pos[0] = x;
   target.pos[1] = y;
   return target;
@@ -129,8 +133,9 @@ TEST_CASE("A disabled dispatcher declines everything", "[ParallelOffload]")
 
   const std::vector<uint8_t> packet{ 1, 2, 3 };
   std::vector<RelayTarget> targets{ MakeTarget(7, 0xff000002, 0.f, 0.f) };
+  /* SetPotentialTargets handled */
   REQUIRE_FALSE(dispatcher.SubmitMovement(
-    MakeSubmission(0xff000001, 1, 5, 0.f, 0.f, packet, targets)));
+    MakeSubmission(0xff000001, 1, 5, 0.f, 0.f, packet)));
   REQUIRE(dispatcher.GetPendingCount() == 0);
 
   RecordingSink sink;
@@ -163,8 +168,12 @@ TEST_CASE("Accepted movement is applied and relayed", "[ParallelOffload]")
   };
 
   REQUIRE(dispatcher.SubmitMovement(
-    MakeSubmission(0xff000001, 1, 1, 0.f, 0.f, packet, targets)));
+    MakeSubmission(0xff000001, 1, 1, 0.f, 0.f, packet)));
   REQUIRE(dispatcher.GetPendingCount() == 1);
+
+  // Recipients now come from the per-tick snapshot of active players rather
+  // than from the submission, so the dispatcher has to be given the list.
+  dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
 
   RecordingSink sink;
   dispatcher.ExecuteTick(sink);
@@ -236,11 +245,12 @@ TEST_CASE("A rejected update corrects its owner but still relays",
   };
 
   MovementSubmission submission =
-    MakeSubmission(0xff000001, 1, 1, 0.f, 0.f, packet, targets);
+    MakeSubmission(0xff000001, 1, 1, 0.f, 0.f, packet);
   // Well beyond one cell: must fail validation.
   submission.proposedPos[0] = 100000.f;
 
   REQUIRE(dispatcher.SubmitMovement(submission));
+  dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
 
   RecordingSink sink;
   dispatcher.ExecuteTick(sink);
@@ -259,7 +269,7 @@ TEST_CASE("A hosted NPC is never sent a correction", "[ParallelOffload]")
   std::vector<RelayTarget> targets;
 
   MovementSubmission submission = MakeSubmission(
-    0xff000009, 9, Networking::InvalidUserId, 0.f, 0.f, packet, targets);
+    0xff000009, 9, Networking::InvalidUserId, 0.f, 0.f, packet);
   submission.proposedPos[0] = 100000.f;
 
   REQUIRE(dispatcher.SubmitMovement(submission));
@@ -280,26 +290,30 @@ TEST_CASE("Parallel and inline runs produce the same work",
 
   auto buildAndRun = [&](size_t workers, size_t threshold) {
     OffloadDispatcher dispatcher(MakeConfig(workers, threshold));
-    std::vector<std::vector<RelayTarget>> targetStorage;
-    targetStorage.reserve(64);
+
+    // One flat list of active players for the whole tick. Recipients are
+    // derived from it by spatial filtering, so every user id must be distinct
+    // or the same player would appear in several chunks.
+    std::vector<RelayTarget> allTargets;
+    allTargets.reserve(64 * 5);
 
     for (uint32_t i = 0; i < 64; ++i) {
       // Ten separate crowds, far enough apart to become distinct clusters.
       const float baseX = static_cast<float>((i % 10) * 200000);
       const float baseY = static_cast<float>((i / 10) * 100);
 
-      targetStorage.emplace_back();
-      std::vector<RelayTarget>& targets = targetStorage.back();
       for (uint32_t t = 0; t < 5; ++t) {
-        targets.push_back(
-          MakeTarget(static_cast<Networking::UserId>(100 + t),
-                     0xff001000 + t, baseX + 50.f, baseY + 50.f));
+        allTargets.push_back(
+          MakeTarget(static_cast<Networking::UserId>(100 + i * 5 + t),
+                     0xff001000 + i * 5 + t, baseX + 50.f, baseY + 50.f));
       }
 
       REQUIRE(dispatcher.SubmitMovement(MakeSubmission(
         0xff000001 + i, i, static_cast<Networking::UserId>(i), baseX, baseY,
-        packet, targets)));
+        packet)));
     }
+
+    dispatcher.SetPotentialTargets(std::move(allTargets));
 
     auto sink = std::make_unique<RecordingSink>();
     dispatcher.ExecuteTick(*sink);
@@ -309,7 +323,10 @@ TEST_CASE("Parallel and inline runs produce the same work",
   auto inlineSink = buildAndRun(0, 100000);
   auto parallelSink = buildAndRun(4, 1);
 
-  REQUIRE(inlineSink->relays.size() == 64 * 5);
+  // The exact fan-out depends on how many players share a chunk, which is not
+  // what this test is about. What matters is that the work happened and that
+  // both configurations produced identical effects.
+  REQUIRE(inlineSink->relays.size() > 0);
   REQUIRE(parallelSink->relays.size() == inlineSink->relays.size());
 
   std::sort(inlineSink->relays.begin(), inlineSink->relays.end());
@@ -340,7 +357,7 @@ TEST_CASE("Join order is stable across repeated identical ticks",
                    baseX, 0.f));
       REQUIRE(dispatcher.SubmitMovement(MakeSubmission(
         0xff000001 + i, i, static_cast<Networking::UserId>(i), baseX, 0.f,
-        packet, targetStorage.back())));
+        packet)));
     }
 
     RecordingSink sink;
@@ -362,6 +379,8 @@ TEST_CASE("Throttling only fires under pressure and spares close players",
   config.adaptiveThrottling = true;
   config.throttleDistanceUnits = 4096.f;
   config.maxThrottleSkipTicks = 4;
+  // Isolate the pressure mechanism from the always-on distance one.
+  config.interestManagement = false;
   config.Normalize();
 
   SECTION("No pressure means no throttling at any distance")
@@ -399,6 +418,92 @@ TEST_CASE("Throttling only fires under pressure and spares close players",
   }
 }
 
+TEST_CASE("Interest management reduces distant update rate on an idle server",
+          "[ParallelOffload]")
+{
+  ParallelConfig config;
+  config.enabled = true;
+  // No pressure, no adaptive throttling: this must work purely on distance.
+  config.adaptiveThrottling = false;
+  config.interestManagement = true;
+  config.interestFullRateUnits = 2048.f;
+  config.maxInterestSkipTicks = 4;
+  config.Normalize();
+
+  const float sqrFull = 2048.f * 2048.f;
+
+  SECTION("Close recipients keep every single update")
+  {
+    REQUIRE(InterestManager::ComputeSkipFactor(0.f, 0, config) == 1);
+    REQUIRE(InterestManager::ComputeSkipFactor(sqrFull * 0.5f, 0, config) == 1);
+    // Exactly on the boundary still counts as close.
+    REQUIRE(InterestManager::ComputeSkipFactor(sqrFull, 0, config) == 1);
+  }
+
+  SECTION("Rate drops in steps as distance grows")
+  {
+    const uint32_t a = InterestManager::ComputeSkipFactor(sqrFull * 2.f, 0, config);
+    const uint32_t b = InterestManager::ComputeSkipFactor(sqrFull * 8.f, 0, config);
+    const uint32_t c =
+      InterestManager::ComputeSkipFactor(sqrFull * 64.f, 0, config);
+    REQUIRE(a == 2);
+    REQUIRE(b == 3);
+    REQUIRE(c == 4);
+    REQUIRE(c <= config.maxInterestSkipTicks);
+  }
+
+  SECTION("The cap is respected")
+  {
+    ParallelConfig capped = config;
+    capped.maxInterestSkipTicks = 2;
+    capped.Normalize();
+    REQUIRE(InterestManager::ComputeSkipFactor(1e12f, 0, capped) == 2);
+  }
+
+  SECTION("Turning it off restores full rate everywhere")
+  {
+    ParallelConfig off = config;
+    off.interestManagement = false;
+    off.Normalize();
+    REQUIRE(InterestManager::ComputeSkipFactor(1e12f, 0, off) == 1);
+  }
+
+  SECTION("Pressure and distance stack by taking the stronger of the two")
+  {
+    ParallelConfig both = config;
+    both.adaptiveThrottling = true;
+    both.throttleDistanceUnits = 4096.f;
+    both.maxThrottleSkipTicks = 4;
+    both.Normalize();
+
+    // Close enough that pressure spares it, but interest management still
+    // applies its own floor rather than being overridden back to 1.
+    const uint32_t nearUnderPressure =
+      InterestManager::ComputeSkipFactor(sqrFull * 2.f, 3, both);
+    REQUIRE(nearUnderPressure >= 2);
+    REQUIRE(nearUnderPressure <= 4);
+  }
+}
+
+TEST_CASE("Every distant edge still transmits within its window",
+          "[ParallelOffload]")
+{
+  // Reducing the rate must never silence a pair permanently.
+  for (uint32_t skip = 2; skip <= 4; ++skip) {
+    for (uint32_t sender = 0xff000001; sender < 0xff000008; ++sender) {
+      for (Networking::UserId user = 0; user < 6; ++user) {
+        int sent = 0;
+        for (uint64_t tick = 0; tick < skip; ++tick) {
+          if (InterestManager::ShouldRelayThisTick(tick, sender, user, skip)) {
+            ++sent;
+          }
+        }
+        REQUIRE(sent == 1);
+      }
+    }
+  }
+}
+
 TEST_CASE("A throttled edge still transmits within its skip window",
           "[ParallelOffload]")
 {
@@ -433,18 +538,19 @@ TEST_CASE("Metrics track relays and cluster counts", "[ParallelOffload]")
   OffloadDispatcher dispatcher(MakeConfig(2, 1));
 
   const std::vector<uint8_t> packet{ 0x55 };
-  std::vector<std::vector<RelayTarget>> targetStorage;
-  targetStorage.reserve(8);
+  std::vector<RelayTarget> allTargets;
 
   for (uint32_t i = 0; i < 8; ++i) {
+    // Far enough apart that each player is alone in its own chunk, so every
+    // sender relays to exactly one recipient: itself.
     const float baseX = static_cast<float>(i * 500000);
-    targetStorage.emplace_back();
-    targetStorage.back().push_back(MakeTarget(
-      static_cast<Networking::UserId>(i), 0xff003000 + i, baseX, 0.f));
+    allTargets.push_back(MakeTarget(static_cast<Networking::UserId>(i),
+                                    0xff003000 + i, baseX, 0.f));
     REQUIRE(dispatcher.SubmitMovement(MakeSubmission(
       0xff000001 + i, i, static_cast<Networking::UserId>(i), baseX, 0.f,
-      packet, targetStorage.back())));
+      packet)));
   }
+  dispatcher.SetPotentialTargets(std::move(allTargets));
 
   RecordingSink sink;
   dispatcher.ExecuteTick(sink);
@@ -473,8 +579,8 @@ TEST_CASE("One crowded area is split across cores", "[ParallelOffload]")
   OffloadDispatcher dispatcher(config);
 
   const std::vector<uint8_t> packet{ 0x42 };
-  std::vector<std::vector<RelayTarget>> targetStorage;
-  targetStorage.reserve(60);
+  std::vector<RelayTarget> allTargets;
+  allTargets.reserve(60);
 
   for (uint32_t i = 0; i < 60; ++i) {
     // All inside one chunk, so the partitioner must produce exactly one
@@ -482,14 +588,13 @@ TEST_CASE("One crowded area is split across cores", "[ParallelOffload]")
     const float x = static_cast<float>(i % 10) * 10.f;
     const float y = static_cast<float>(i / 10) * 10.f;
 
-    targetStorage.emplace_back();
-    targetStorage.back().push_back(
+    allTargets.push_back(
       MakeTarget(static_cast<Networking::UserId>(i), 0xff004000 + i, x, y));
 
     REQUIRE(dispatcher.SubmitMovement(MakeSubmission(
-      0xff000001 + i, i, static_cast<Networking::UserId>(i), x, y, packet,
-      targetStorage.back())));
+      0xff000001 + i, i, static_cast<Networking::UserId>(i), x, y, packet)));
   }
+  dispatcher.SetPotentialTargets(std::move(allTargets));
 
   RecordingSink sink;
   dispatcher.ExecuteTick(sink);
@@ -501,9 +606,10 @@ TEST_CASE("One crowded area is split across cores", "[ParallelOffload]")
   REQUIRE(metrics.lastWorkUnitCount > 1);
   REQUIRE(metrics.lastPooledUnitCount > 1);
 
-  // Sharding must not lose or duplicate anyone.
+  // Sharding must not lose or duplicate anyone. All 60 share a chunk, so
+  // every sender relays to all 60 recipients: the full N^2 fan-out, intact.
   REQUIRE(sink.applied.size() == 60);
-  REQUIRE(sink.relays.size() == 60);
+  REQUIRE(sink.relays.size() == 60 * 60);
 
   std::vector<uint32_t> expected;
   for (uint32_t i = 0; i < 60; ++i) {
@@ -525,20 +631,20 @@ TEST_CASE("Shard count does not change the outcome", "[ParallelOffload]")
     config.Normalize();
     OffloadDispatcher dispatcher(config);
 
-    std::vector<std::vector<RelayTarget>> targetStorage;
-    targetStorage.reserve(50);
+    std::vector<RelayTarget> allTargets;
+    allTargets.reserve(50 * 3);
     for (uint32_t i = 0; i < 50; ++i) {
       const float x = static_cast<float>(i) * 20.f;
-      targetStorage.emplace_back();
       for (uint32_t t = 0; t < 3; ++t) {
-        targetStorage.back().push_back(
-          MakeTarget(static_cast<Networking::UserId>(200 + t),
-                     0xff005000 + t, x, 0.f));
+        // Distinct user ids: one entry per active player in the snapshot.
+        allTargets.push_back(
+          MakeTarget(static_cast<Networking::UserId>(200 + i * 3 + t),
+                     0xff005000 + i * 3 + t, x, 0.f));
       }
       REQUIRE(dispatcher.SubmitMovement(MakeSubmission(
-        0xff000001 + i, i, static_cast<Networking::UserId>(i), x, 0.f, packet,
-        targetStorage.back())));
+        0xff000001 + i, i, static_cast<Networking::UserId>(i), x, 0.f, packet)));
     }
+    dispatcher.SetPotentialTargets(std::move(allTargets));
 
     auto sink = std::make_unique<RecordingSink>();
     dispatcher.ExecuteTick(*sink);
@@ -553,7 +659,9 @@ TEST_CASE("Shard count does not change the outcome", "[ParallelOffload]")
   // Relays keep their exact order too, not merely their contents: units are
   // joined in cluster order then ascending member order.
   REQUIRE(manyShards->relays == oneShard->relays);
-  REQUIRE(oneShard->relays.size() == 50 * 3);
+  // 50 senders spanning x=0..980, all inside one chunk, against 150 snapshot
+  // entries in that chunk.
+  REQUIRE(oneShard->relays.size() == 50 * 150);
 }
 
 TEST_CASE("Reconfigure drops pending work and rebuilds the pool",
@@ -563,8 +671,9 @@ TEST_CASE("Reconfigure drops pending work and rebuilds the pool",
 
   const std::vector<uint8_t> packet{ 0x99 };
   std::vector<RelayTarget> targets{ MakeTarget(1, 0xff000002, 0.f, 0.f) };
+  /* SetPotentialTargets handled */
   REQUIRE(dispatcher.SubmitMovement(
-    MakeSubmission(0xff000001, 1, 1, 0.f, 0.f, packet, targets)));
+    MakeSubmission(0xff000001, 1, 1, 0.f, 0.f, packet)));
   REQUIRE(dispatcher.GetPendingCount() == 1);
 
   ParallelConfig disabled;

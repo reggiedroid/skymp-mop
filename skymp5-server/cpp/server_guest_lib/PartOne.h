@@ -42,10 +42,6 @@ public:
   void Send(Networking::UserId targetUserId, const IMessageBase& message,
             bool reliable);
 
-  void SendList(Networking::UserId targetUserId,
-                const Networking::PacketData* dataArray, const size_t* lengths,
-                size_t count, bool reliable) override;
-
 private:
   Networking::ISendTarget& underlyingSendTarget;
 };

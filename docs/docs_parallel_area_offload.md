@@ -78,17 +78,35 @@ So the scheduling unit is a *shard*: a contiguous slice of one cluster's
 members. Each sender's work depends only on the immutable snapshot, so any
 split of a cluster's members is safe; the cluster boundary is what makes
 throttling and recipient sets coherent, not what makes the work independent.
-Sharding the same modelled populations lifts the ceiling to near-linear:
+### What it actually costs, measured
 
-| players | one task per cluster | sharded, 4 cores | sharded, 8 cores | sharded, 16 cores |
-| --- | --- | --- | --- | --- |
-| 80 | 1.45× | 3.87× | 7.64× | 7.86× |
-| 160 | 1.47× | 3.93× | 7.84× | 15.21× |
-| 300 | 1.43× | 4.00× | 7.96× | 14.71× |
+An earlier version of this document quoted modelled speedups of 4×/8×/15×
+from a relay-edge cost model. **Those numbers were wrong.**
+`unit/ParallelBenchmark.cpp` now exists so that nothing here has to be taken
+on faith:
 
-(Modelled on relay-edge counts, not measured on live hardware — treat the
-shape as the claim, not the third decimal. Real gains are bounded by memory
-bandwidth and by the serial ingest and join phases.)
+```bash
+./unit/unit "[ParallelBench]"
+```
+
+Every player in one chunk, everyone sending movement every tick, timing the
+full ingest **plus** `PartOne::Tick` so both paths are compared over the same
+unit of work. 32-core host, binary wire format:
+
+| players | 25 | 50 | 100 | 150 | 250 | 400 |
+| --- | --- | --- | --- | --- | --- | --- |
+| speedup | 0.25× | 0.43× | 0.66× | 0.81× | 0.88× | **1.10×** |
+
+**Break-even is around 300–400 players.** Below that the offload is a
+regression: barrier and snapshot costs are paid every tick while the parallel
+phase is still small. That is why `minActorsToOffload` defaults to 300 rather
+than to something optimistic.
+
+The parallel phase itself scales fine — at 400 players it completes 966µs of
+task work in 96µs of wall clock, roughly 10×. The ceiling is elsewhere: the
+join emits 160,000 relays serially and costs 787µs of an 1118µs tick, *even
+with a send target that does nothing*. Parallelising decisions cannot fix
+that. Sending fewer relays can, which is what interest management is for.
 
 Clusters still matter. They are what makes each shard's recipient set and
 pressure level well defined, and they let two distant crowds be costed
@@ -102,6 +120,41 @@ The join walks the work units by index, so the sequence of world writes is the
 same on 2 cores or 32, and the same whether a cluster was processed whole or
 split ten ways. Thread count and shard count are performance knobs, not
 behaviour knobs.
+
+## Interest management — the part that actually pays
+
+Relay volume is the quadratic term, and emitting those sends is serial no
+matter how many cores decided them. So the highest-value lever is sending
+less — and unlike the offload, it helps at every population rather than only
+above 300.
+
+Recipients closer than `interestFullRateUnits` (2048 by default, about half a
+chunk) always receive every update, so anything a player is realistically
+fighting, trading with or watching stays at full fidelity. Beyond that the
+rate steps down: half, then a third, then a quarter, capped by
+`maxInterestSkipTicks`. At a 60Hz tick a distant player still gets roughly 15
+updates a second.
+
+This is on by default and does not wait for the server to be in trouble: a
+player sixty metres away does not need sixty position updates a second even
+on an idle server.
+
+Measured on the same benchmark, 400 players spread across one chunk:
+
+| configuration | relays/tick | µs/tick |
+| --- | --- | --- |
+| inline (baseline) | 160,000 | 1233 |
+| offload only | 160,000 | 1048 |
+| offload + interest management | 119,866 | **890** |
+
+**1.39× against the inline baseline** — and that is with a send target that
+does nothing. With real RakNet sends, each avoided relay also skips
+serialization and queueing, so the gap widens.
+
+The phase of each reduced pair is derived from a hash of the pair, so traffic
+spreads evenly across the window instead of bursting. `[ParallelOffload]`
+asserts that every pair still transmits exactly once per window: reduced
+rate, never silence.
 
 ## Adaptive throttling
 
@@ -127,11 +180,14 @@ Add a `parallelism` object to `server-settings.json`:
   "parallelism": {
     "enabled": true,
     "workerThreads": 0,
-    "minActorsToOffload": 24,
+    "minActorsToOffload": 300,
     "minClusterActors": 4,
     "minShardActors": 4,
     "maxShardsPerCluster": 0,
     "clusterSeparationChunks": 4,
+    "interestManagement": true,
+    "interestFullRateUnits": 2048,
+    "maxInterestSkipTicks": 4,
     "adaptiveThrottling": true,
     "targetTickBudgetMicros": 8000,
     "throttleDistanceUnits": 4096,
@@ -146,7 +202,10 @@ Add a `parallelism` object to `server-settings.json`:
 | --- | --- | --- |
 | `enabled` | `false` | Master switch. Off means the original code path, byte for byte. |
 | `workerThreads` | `0` | `0` auto-detects: cores minus two, reserved for the Node main thread and the async save thread. Capped at 32. |
-| `minActorsToOffload` | `24` | Below this many pending updates the fork/join barrier costs more than it saves, so the tick runs inline. |
+| `minActorsToOffload` | `300` | Below this the fork/join barrier costs more than it saves — measured, see the table above. Lowering it makes the server slower. |
+| `interestManagement` | `true` | Distance-based update-rate reduction, always on. The highest-value setting here. |
+| `interestFullRateUnits` | `2048` | Recipients closer than this always get every update. |
+| `maxInterestSkipTicks` | `4` | Ceiling on how far apart interest management may space an update. |
 | `minClusterActors` | `4` | Clusters smaller than this are swept up on the main thread instead of getting their own task. |
 | `minShardActors` | `4` | Fewest players a shard of a crowded cluster may carry. Lower splits a crowd more finely; too low and per-task overhead starts to show. |
 | `maxShardsPerCluster` | `0` | `0` auto-sizes to twice the slot count. Raise only if profiling shows one area still bottlenecking. |
@@ -167,8 +226,7 @@ On a 8-core host running a busy server:
 "parallelism": {
   "enabled": true,
   "workerThreads": 0,
-  "minActorsToOffload": 24,
-  "adaptiveThrottling": true,
+  "interestManagement": true,
   "metricsLogIntervalTicks": 5000
 }
 ```

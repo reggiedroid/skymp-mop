@@ -31,7 +31,6 @@ uint64_t LoadBalancer::EstimateMicros(const AreaCluster& cluster) const
   }
 
   const double estimate =
-    static_cast<double>(cluster.Size() * cluster.Size()) * kColdStartMicrosPerEdge +
     static_cast<double>(cluster.Size()) * kColdStartMicrosPerActor;
   return static_cast<uint64_t>(estimate);
 }
