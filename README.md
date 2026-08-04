@@ -40,14 +40,15 @@ Per tick, the server now:
 
 1. **Ingests** movement packets on the main thread as before, but instead of
    relaying immediately it flattens each update — the actor's transform, the
-   animation flags, the raw packet bytes, and the list of players who can
-   currently see them — into a plain-data snapshot.
+   animation flags and the raw packet bytes — into a plain-data snapshot, and
+   records every active player's position once. That second list is O(N) in
+   the player count, not O(N²) in the relay edges.
 2. **Partitions** the actors into *area clusters* that provably cannot
    influence one another this tick, then splits each cluster into **work
    units** small enough to spread across the pool.
 3. **Processes each unit on a worker thread**: validating the movement,
-   deciding which recipients should receive the update this tick, and building
-   the outbound send list.
+   spatially filtering that snapshot down to the recipients who can actually
+   see the sender, and building the outbound send list.
 4. **Joins** on the main thread, applying world state and handing the packets
    to the network in a fixed, reproducible order.
 

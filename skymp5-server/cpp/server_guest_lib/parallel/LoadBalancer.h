@@ -63,10 +63,12 @@ private:
   // unrelated stall does not pin the area at maximum throttle.
   static constexpr double kEmaAlpha = 0.3;
 
-  // Microseconds attributed to one relay edge before any measurement exists.
-  // Only used for cold-start ordering, so being off by a factor of two costs
+  // Microseconds attributed to one actor before any measurement exists. Only
+  // used for cold-start ordering, so being off by a factor of two costs
   // nothing but a slightly worse schedule on the first tick.
-  static constexpr double kColdStartMicrosPerEdge = 0.35;
+  //
+  // There is no per-edge term: relay edges are no longer enumerated on the
+  // main thread, so a cluster's cost is estimated from its population.
   static constexpr double kColdStartMicrosPerActor = 2.0;
 
   std::unordered_map<AreaKey, CostEntry, AreaKeyHash> costByArea;
