@@ -1,6 +1,6 @@
 
 
-# Multi-Core Area Offload
+# SkyMP: MOP (Multiplayer Optimization Project)
 
 Skyrim itself is effectively single-threaded, and so was the SkyMP server: one
 Node thread drives `ScampServer::Tick`, which pumps every packet and runs every
