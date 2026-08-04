@@ -40,8 +40,6 @@ struct MovementSubmission
   // The client's packet, forwarded to neighbours byte for byte.
   const uint8_t* packetData = nullptr;
   size_t packetLength = 0;
-
-
 };
 
 // The main-thread effects the join phase has to perform. Splitting them
@@ -67,16 +65,6 @@ public:
 
   virtual void SendRelay(Networking::UserId userId, const uint8_t* data,
                          size_t length, bool reliable) = 0;
-
-  virtual void SendRelayList(Networking::UserId userId,
-                             const Networking::PacketData* dataArray,
-                             const size_t* lengths, size_t count,
-                             bool reliable)
-  {
-    for (size_t i = 0; i < count; ++i) {
-      SendRelay(userId, dataArray[i], lengths[i], reliable);
-    }
-  }
 };
 
 // Collects movement updates during packet ingest, processes them across the
@@ -111,6 +99,11 @@ public:
   // must fall back to handling it inline. That happens when the framework is
   // disabled and on any malformed submission, so a rejection is always safe.
   bool SubmitMovement(const MovementSubmission& submission);
+
+  // Called once per tick by the main thread to snapshot all active listeners.
+  // This $O(N)$ snapshot is passed to workers so they can spatially filter
+  // recipients without enumerating the $O(N^2)$ edges on the main thread.
+  void SetPotentialTargets(std::vector<RelayTarget>&& targets);
 
   [[nodiscard]] size_t GetPendingCount() const noexcept
   {

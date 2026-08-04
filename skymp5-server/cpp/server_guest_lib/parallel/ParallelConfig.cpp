@@ -67,6 +67,10 @@ void ParallelConfig::Normalize()
 
   throttleDistanceUnits = std::max(throttleDistanceUnits, 1.f);
   maxThrottleSkipTicks = std::min<uint32_t>(maxThrottleSkipTicks, 32);
+
+  interestFullRateUnits = std::max(interestFullRateUnits, 1.f);
+  maxInterestSkipTicks =
+    std::min<uint32_t>(std::max<uint32_t>(maxInterestSkipTicks, 1), 32);
 }
 
 ParallelConfig ParallelConfig::FromServerSettings(
@@ -89,6 +93,12 @@ ParallelConfig ParallelConfig::FromServerSettings(
   config.enabled = ReadBool(j, "enabled", config.enabled);
   config.adaptiveThrottling =
     ReadBool(j, "adaptiveThrottling", config.adaptiveThrottling);
+  config.interestManagement =
+    ReadBool(j, "interestManagement", config.interestManagement);
+  config.interestFullRateUnits = ReadNumber<float>(
+    j, "interestFullRateUnits", config.interestFullRateUnits);
+  config.maxInterestSkipTicks = ReadNumber<uint32_t>(
+    j, "maxInterestSkipTicks", config.maxInterestSkipTicks);
 
   config.workerThreads =
     ReadNumber<size_t>(j, "workerThreads", config.workerThreads);
@@ -127,10 +137,12 @@ std::string ParallelConfig::Describe() const
   return fmt::format(
     "parallel area offload: enabled, workerThreads={}, "
     "minActorsToOffload={}, minClusterActors={}, minShardActors={}, "
-    "separation={} chunks, adaptiveThrottling={}, budget={}us",
+    "separation={} chunks, interestManagement={} (fullRate={}u, maxSkip={}), "
+    "adaptiveThrottling={}, budget={}us",
     workerThreads, minActorsToOffload, minClusterActors, minShardActors,
-    clusterSeparationChunks, adaptiveThrottling ? "on" : "off",
-    targetTickBudgetMicros);
+    clusterSeparationChunks, interestManagement ? "on" : "off",
+    interestFullRateUnits, maxInterestSkipTicks,
+    adaptiveThrottling ? "on" : "off", targetTickBudgetMicros);
 }
 
 }

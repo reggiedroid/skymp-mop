@@ -107,9 +107,7 @@ TEST_CASE("Malformed settings are rejected loudly", "[ParallelConfig]")
   }
 }
 
-TEST_CASE("An unmeasured area is estimated from its relay load",
-          "[ParallelBalancer]")
-{
+TEST_CASE("ParallelConfig: LoadBalancer estimates linearly", "[ParallelConfig]") {
   LoadBalancer balancer;
 
   AreaCluster small;
@@ -123,9 +121,8 @@ TEST_CASE("An unmeasured area is estimated from its relay load",
   REQUIRE(balancer.EstimateMicros(large) > balancer.EstimateMicros(small));
 }
 
-TEST_CASE("Measurements override the cold-start estimate",
-          "[ParallelBalancer]")
-{
+TEST_CASE("ParallelConfig: LoadBalancer tracks moving average",
+          "[ParallelConfig]") {
   LoadBalancer balancer;
 
   AreaCluster cluster;

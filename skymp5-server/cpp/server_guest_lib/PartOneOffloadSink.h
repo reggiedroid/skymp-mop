@@ -21,10 +21,6 @@ public:
   void SendCorrection(const MpParallel::ActorSnapshot& actor) override;
   void SendRelay(Networking::UserId userId, const uint8_t* data, size_t length,
                  bool reliable) override;
-  void SendRelayList(Networking::UserId userId,
-                     const Networking::PacketData* dataArray,
-                     const size_t* lengths, size_t count,
-                     bool reliable) override;
 
   // Counts submissions dropped at join time because the actor was gone.
   // Non-zero is expected during heavy churn; steadily growing is a bug.

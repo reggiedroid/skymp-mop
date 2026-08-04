@@ -142,7 +142,6 @@ private:
 
   PartOne& partOne;
 
-
   // TODO: inverse dependency
   std::shared_ptr<CraftService> craftService;
   std::shared_ptr<SweetHidePlayerNamesService> sweetHidePlayerNamesService;

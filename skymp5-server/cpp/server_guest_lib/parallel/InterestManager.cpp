@@ -49,21 +49,59 @@ bool ValidateMovement(const ActorSnapshot& actor) noexcept
     kSqrMaxMovementDistance;
 }
 
+namespace {
+
+// Always-on, load-independent rate reduction by distance.
+//
+// Relay volume is the quadratic term, and emitting the sends is serial no
+// matter how the decisions were parallelised, so sending fewer of them is the
+// only thing that attacks the real cost. Nearby recipients are never affected.
+[[nodiscard]] uint32_t InterestSkipFactor(
+  float sqrDistance, const ParallelConfig& config) noexcept
+{
+  if (!config.interestManagement) {
+    return 1;
+  }
+
+  const float full = config.interestFullRateUnits;
+  const float sqrFull = full * full;
+  if (sqrDistance <= sqrFull) {
+    return 1;
+  }
+
+  // One step per doubling of the full-rate radius. Squared comparisons keep
+  // this free of square roots on the hottest path in the server.
+  uint32_t factor = 2;
+  if (sqrDistance > sqrFull * 4.f) {
+    factor = 3;
+  }
+  if (sqrDistance > sqrFull * 16.f) {
+    factor = 4;
+  }
+
+  return std::min(factor, std::max<uint32_t>(config.maxInterestSkipTicks, 1));
+}
+
+}
+
 uint32_t ComputeSkipFactor(float sqrDistance, uint32_t pressureLevel,
                            const ParallelConfig& config) noexcept
 {
+  // Baseline interest management applies whether or not the server is busy.
+  const uint32_t interest = InterestSkipFactor(sqrDistance, config);
+
   if (!config.adaptiveThrottling || pressureLevel == 0) {
-    return 1;
+    return interest;
   }
 
   const float threshold = config.throttleDistanceUnits;
   const float sqrThreshold = threshold * threshold;
 
-  // Inside the near band nothing is ever held back: those are the players
-  // actually fighting or talking to each other, and they are what "smooth"
-  // means to a user.
+  // Inside the near band nothing is ever held back by pressure: those are the
+  // players actually fighting or talking to each other, and they are what
+  // "smooth" means to a user.
   if (sqrDistance <= sqrThreshold) {
-    return 1;
+    return interest;
   }
 
   // One extra step per doubling of the threshold distance. Comparing squared
@@ -78,8 +116,13 @@ uint32_t ComputeSkipFactor(float sqrDistance, uint32_t pressureLevel,
 
   const uint64_t factor =
     static_cast<uint64_t>(pressureLevel) * distanceBand + 1;
-  return static_cast<uint32_t>(
-    std::min<uint64_t>(factor, std::max<uint32_t>(config.maxThrottleSkipTicks, 1)));
+  const auto pressureSkip = static_cast<uint32_t>(std::min<uint64_t>(
+    factor, std::max<uint32_t>(config.maxThrottleSkipTicks, 1)));
+
+  // The two mechanisms stack by taking the stronger one rather than
+  // multiplying, so an overloaded server never starves a distant player
+  // beyond whichever cap is the more conservative.
+  return std::max(interest, pressureSkip);
 }
 
 bool ShouldRelayThisTick(uint64_t tickIndex, uint32_t senderFormId,

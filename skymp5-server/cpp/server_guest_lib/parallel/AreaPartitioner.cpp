@@ -156,7 +156,6 @@ void AreaPartitioner::Partition(std::vector<ActorSnapshot>& actors,
 
     AreaCluster& cluster = outClusters[clusterIndex];
     cluster.actorIndices.push_back(actorIndex);
-
   }
 }
 

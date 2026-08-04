@@ -42,7 +42,7 @@ simdjson::dom::parser& ScratchParser()
 
 template <class Message>
 std::optional<DeserializeResult> Deserialize(
-  const uint8_t* rawMessageJsonOrBinary, size_t length)
+  const uint8_t* rawMessageJsonOrBinary, size_t length, const simdjson::dom::element* parsedJson)
 {
   if (length >= 2 && rawMessageJsonOrBinary[1] == Message::kMsgType.value) {
     // byte 0 is packet id => skipping here
@@ -67,44 +67,15 @@ std::optional<DeserializeResult> Deserialize(
     return result;
   }
 
-  // simdjson requires SIMDJSON_PADDING bytes of slack past the document, so
-  // the input is copied into a reused, padded buffer rather than a fresh
-  // std::string per call.
-  thread_local std::string str;
-  str.assign(reinterpret_cast<const char*>(rawMessageJsonOrBinary + 1),
-             length - 1);
-
-  auto parseResult = ScratchParser().parse(str);
-  if (auto err = parseResult.error()) {
-    throw std::runtime_error(
-      fmt::format("failed to parse message, simdjson error: {}",
-                  simdjson::error_message(err)));
-  }
-  auto parsedJson = parseResult.value_unsafe();
-
-  auto msgTypeResult = parsedJson.at_key("t").get_uint64();
-  if (msgTypeResult.error() == simdjson::NO_SUCH_FIELD) {
-    // Messages produced by the server use string "type" instead of integer "t"
-    // We will refactor them out at some point
-    return std::nullopt;
-  }
-  if (auto err = msgTypeResult.error()) {
-    throw std::runtime_error(
-      fmt::format("failed to get message type, simdjson error: {}",
-                  simdjson::error_message(err)));
-  }
-  auto msgType = msgTypeResult.value_unsafe();
-
-  if (msgType != Message::kMsgType) {
-    // In case of JSON we keep searching in deserializers array
+  if (!parsedJson) {
     return std::nullopt;
   }
 
   Message message;
-  message.ReadJson(parsedJson);
+  message.ReadJson(*parsedJson);
 
   DeserializeResult result;
-  result.msgType = static_cast<MsgType>(msgType);
+  result.msgType = static_cast<MsgType>(Message::kMsgType.value);
   result.message = std::make_unique<Message>(std::move(message));
   result.format = DeserializeInputFormat::Json;
   return result;
@@ -231,7 +202,13 @@ std::optional<DeserializeResult> MessageSerializer::Deserialize(
       return std::nullopt;
     }
 
-    return deserializerFns[index](rawMessageJsonOrBinary, length);
+    // Materialize into a named local rather than taking the address of an
+    // rvalue-qualified accessor's result. dom::element is a lightweight handle
+    // into the parser's tape, so this copy is free and removes any doubt about
+    // what the pointer outlives.
+    const simdjson::dom::element parsedElement = peekResult.value_unsafe();
+    return deserializerFns[index](rawMessageJsonOrBinary, length,
+                                  &parsedElement);
   }
 
   if (headerByte >= deserializerFns.size()) {
@@ -249,11 +226,11 @@ std::optional<DeserializeResult> MessageSerializer::Deserialize(
       static_cast<int>(headerByte),
       fmt::join(std::vector<uint8_t>(rawMessageJsonOrBinary,
                                      rawMessageJsonOrBinary + length),
-                ", "));
+                ""));
     return std::nullopt;
   }
 
-  auto result = deserializerFn(rawMessageJsonOrBinary, length);
+  auto result = deserializerFn(rawMessageJsonOrBinary, length, nullptr);
   if (result == std::nullopt) {
     spdlog::warn(
       "MessageSerializer::Deserialize - deserializerFn returned "

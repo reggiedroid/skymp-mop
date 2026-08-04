@@ -21,10 +21,6 @@ struct AreaCluster
   // cost model.
   uint32_t chunkCount = 0;
 
-  // Sum of relayCount over the members: the quantity the parallel phase
-  // actually scales with, and therefore the basis of the cost estimate.
-
-
   [[nodiscard]] size_t Size() const noexcept { return actorIndices.size(); }
 };
 

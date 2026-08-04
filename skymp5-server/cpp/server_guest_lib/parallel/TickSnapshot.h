@@ -61,15 +61,16 @@ struct ActorSnapshot
   uint32_t clusterIndex = kUnassignedCluster;
 };
 
-// A single actor that can currently see the sender, resolved to a connected
-// user. Actors without a user (unhosted NPCs) are not emitted at all, which
-// is what the inline path effectively does when UserByActor returns
-// InvalidUserId.
+// A single actor that is connected and active. The main thread snapshots
+// every active player once per tick, and workers spatial-filter this list.
 struct RelayTarget
 {
   Networking::UserId userId = Networking::InvalidUserId;
   uint32_t listenerFormId = 0;
   float pos[3] = { 0.f, 0.f, 0.f };
+  uint32_t worldOrCell = 0;
+  int16_t chunkX = 0;
+  int16_t chunkY = 0;
 };
 
 // Immutable-during-the-parallel-phase view of everything submitted this tick.

@@ -402,13 +402,6 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
 
   clusterMicros.assign(clusters.size(), 0);
 
-  std::vector<OutboundSend> allSends;
-  size_t totalSends = 0;
-  for (const ClusterOutput& output : unitOutputs) {
-    totalSends += output.sends.size();
-  }
-  allSends.reserve(totalSends);
-
   // Work-unit order: cluster index, then ascending member order within the
   // cluster. Both are fixed before any task starts, so the same inputs
   // produce the same sequence of world writes no matter how many cores ran
@@ -423,7 +416,9 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
             snapshot.rawPacketBytes.size()) {
         continue;
       }
-      allSends.push_back(send);
+      sink.SendRelay(send.userId,
+                     snapshot.rawPacketBytes.data() + send.byteOffset,
+                     send.byteLength, send.reliable);
     }
 
     for (const MovementVerdict& verdict : output.verdicts) {
@@ -449,34 +444,6 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
     if (unit.clusterIndex < clusterMicros.size()) {
       clusterMicros[unit.clusterIndex] += output.elapsedMicros;
     }
-  }
-
-  std::sort(allSends.begin(), allSends.end(), [](const OutboundSend& a, const OutboundSend& b) {
-    if (a.userId != b.userId) return a.userId < b.userId;
-    return a.reliable < b.reliable;
-  });
-
-  std::vector<Networking::PacketData> batchData;
-  std::vector<size_t> batchLengths;
-  batchData.reserve(32);
-  batchLengths.reserve(32);
-
-  size_t i = 0;
-  while (i < allSends.size()) {
-    Networking::UserId currentUserId = allSends[i].userId;
-    bool currentReliable = allSends[i].reliable;
-    batchData.clear();
-    batchLengths.clear();
-
-    size_t j = i;
-    while (j < allSends.size() && allSends[j].userId == currentUserId && allSends[j].reliable == currentReliable) {
-      batchData.push_back(snapshot.rawPacketBytes.data() + allSends[j].byteOffset);
-      batchLengths.push_back(allSends[j].byteLength);
-      ++j;
-    }
-
-    sink.SendRelayList(currentUserId, batchData.data(), batchLengths.data(), batchData.size(), currentReliable);
-    i = j;
   }
 
   // Cost is tracked per area, so a cluster's shards are summed back together
