@@ -28,6 +28,18 @@ void Serialize(const simdjson::dom::element& inputJson,
   Serialize(message, outputStream);
 }
 
+// Reused across calls instead of being constructed per message.
+//
+// simdjson::dom::parser owns its scratch buffers, so constructing one per
+// packet means a fresh allocation on every message, and the JSON path used to
+// do that once per candidate deserializer. thread_local keeps it safe if
+// deserialization ever moves off the main thread.
+simdjson::dom::parser& ScratchParser()
+{
+  thread_local simdjson::dom::parser parser;
+  return parser;
+}
+
 template <class Message>
 std::optional<DeserializeResult> Deserialize(
   const uint8_t* rawMessageJsonOrBinary, size_t length)
@@ -55,10 +67,14 @@ std::optional<DeserializeResult> Deserialize(
     return result;
   }
 
-  std::string str(reinterpret_cast<const char*>(rawMessageJsonOrBinary + 1),
-                  length - 1);
-  simdjson::dom::parser sjParser;
-  auto parseResult = sjParser.parse(str);
+  // simdjson requires SIMDJSON_PADDING bytes of slack past the document, so
+  // the input is copied into a reused, padded buffer rather than a fresh
+  // std::string per call.
+  thread_local std::string str;
+  str.assign(reinterpret_cast<const char*>(rawMessageJsonOrBinary + 1),
+             length - 1);
+
+  auto parseResult = ScratchParser().parse(str);
   if (auto err = parseResult.error()) {
     throw std::runtime_error(
       fmt::format("failed to parse message, simdjson error: {}",
@@ -177,23 +193,45 @@ std::optional<DeserializeResult> MessageSerializer::Deserialize(
 
   auto headerByte = rawMessageJsonOrBinary[1];
   if (headerByte == '{') {
-    std::string s(reinterpret_cast<const char*>(rawMessageJsonOrBinary) + 1,
-                  length - 1);
-    spdlog::trace(
-      "MessageSerializer::Deserialize - Encountered JSON message {}", s);
-    // TODO(#2257): try to pass JSON in advance, avoid parsing each time
-    for (auto fn : deserializerFns) {
-      if (fn) {
-        auto result = fn(rawMessageJsonOrBinary, length);
-        if (result) {
-          spdlog::trace("MessageSerializer::Deserialize - Deserialized");
-          return result;
-        }
-      }
+    if (spdlog::should_log(spdlog::level::trace)) {
+      // Only materialize the message text when trace is actually enabled;
+      // this used to allocate a copy of every JSON packet unconditionally.
+      spdlog::trace(
+        "MessageSerializer::Deserialize - Encountered JSON message {}",
+        std::string(reinterpret_cast<const char*>(rawMessageJsonOrBinary) + 1,
+                    length - 1));
     }
-    spdlog::trace("MessageSerializer::Deserialize - Failed to deserialize, "
-                  "falling back to PacketParser.cpp");
-    return std::nullopt;
+
+    // Read the message type once and dispatch straight to its deserializer.
+    // Walking the whole table meant every candidate ahead of the real type
+    // re-parsed the entire document before rejecting it (addresses the
+    // long-standing TODO(#2257) that used to live here).
+    thread_local std::string peek;
+    peek.assign(reinterpret_cast<const char*>(rawMessageJsonOrBinary) + 1,
+                length - 1);
+
+    auto peekResult = ScratchParser().parse(peek);
+    if (peekResult.error()) {
+      spdlog::trace("MessageSerializer::Deserialize - JSON parse failed");
+      return std::nullopt;
+    }
+
+    auto typeResult = peekResult.value_unsafe().at_key("t").get_uint64();
+    if (typeResult.error()) {
+      // Server-produced messages use a string "type" field instead of "t";
+      // those are handled further down the pipeline.
+      return std::nullopt;
+    }
+
+    const auto index = static_cast<size_t>(typeResult.value_unsafe());
+    if (index >= deserializerFns.size() || !deserializerFns[index]) {
+      spdlog::trace("MessageSerializer::Deserialize - no deserializer for "
+                    "JSON message type {}",
+                    index);
+      return std::nullopt;
+    }
+
+    return deserializerFns[index](rawMessageJsonOrBinary, length);
   }
 
   if (headerByte >= deserializerFns.size()) {
