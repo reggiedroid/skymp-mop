@@ -231,33 +231,6 @@ bool ActionListener::TrySubmitMovementForOffload(
     reinterpret_cast<const uint8_t*>(rawMsgData.unparsed);
   submission.packetLength = rawMsgData.unparsedLength;
 
-  // Resolve the recipients now, while we are still on the main thread and
-  // may dereference actors. Workers only ever see this flattened copy.
-  relayTargetScratch.clear();
-  for (MpActor* listener : actor.GetActorListeners()) {
-    if (!listener) {
-      continue;
-    }
-    const Networking::UserId targetUserId =
-      partOne.serverState.UserByActor(listener);
-    if (targetUserId == Networking::InvalidUserId) {
-      continue;
-    }
-
-    MpParallel::RelayTarget target;
-    target.userId = targetUserId;
-    target.listenerFormId = listener->GetFormId();
-    const NiPoint3& listenerPos = listener->GetPos();
-    target.pos[0] = listenerPos.x;
-    target.pos[1] = listenerPos.y;
-    target.pos[2] = listenerPos.z;
-    relayTargetScratch.push_back(target);
-  }
-
-  submission.relayTargets =
-    relayTargetScratch.empty() ? nullptr : relayTargetScratch.data();
-  submission.relayTargetCount = relayTargetScratch.size();
-
   return partOne.GetOffloadDispatcher().SubmitMovement(submission);
 }
 

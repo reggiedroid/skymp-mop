@@ -18,8 +18,8 @@
 #include "OpenSSLSigner.h"
 #include "PacketParser.h"
 #include "PartOneOffloadSink.h"
+#include "parallel/AreaKey.h"
 #include "parallel/OffloadDispatcher.h"
-
 PartOneSendTargetWrapper::PartOneSendTargetWrapper(
   Networking::ISendTarget& underlyingSendTarget_)
   : underlyingSendTarget(underlyingSendTarget_)
@@ -45,6 +45,15 @@ void PartOneSendTargetWrapper::Send(Networking::UserId targetUserId,
        stream.GetNumberOfBytesUsed(), reliable);
 }
 
+void PartOneSendTargetWrapper::SendList(Networking::UserId targetUserId,
+                                        const Networking::PacketData* dataArray,
+                                        const size_t* lengths, size_t count,
+                                        bool reliable)
+{
+  underlyingSendTarget.SendList(targetUserId, dataArray, lengths, count,
+                                reliable);
+}
+
 class FakeSendTarget : public Networking::ISendTarget
 {
 public:
@@ -65,6 +74,15 @@ public:
     }
 
     messages.push_back(PartOne::Message{ j, message, targetUserId, reliable });
+  }
+
+  void SendList(Networking::UserId targetUserId,
+                const Networking::PacketData* dataArray, const size_t* lengths,
+                size_t count, bool reliable) override
+  {
+    for (size_t i = 0; i < count; ++i) {
+      Send(targetUserId, dataArray[i], lengths[i], reliable);
+    }
   }
 
   std::vector<PartOne::Message> messages;
@@ -98,6 +116,10 @@ struct PartOne::Impl
   bool enableGamemodeDataUpdatesBroadcast = false;
 
   PartOne::OnActorStreamIn onActorStreamIn;
+
+  // Reused across TickDeferredMessages calls to avoid allocations on the hot path
+  std::vector<const uint8_t*> deferredDataScratch;
+  std::vector<size_t> deferredLengthsScratch;
 
   // Always present, but does nothing until ConfigureParallelism turns it on.
   std::unique_ptr<MpParallel::OffloadDispatcher> offloadDispatcher;
@@ -163,6 +185,32 @@ void PartOne::Tick()
   // tick's packet pump lands before timers get a chance to act on positions,
   // which is the order the inline path produced.
   if (pImpl->offloadDispatcher && pImpl->offloadSink) {
+    std::vector<MpParallel::RelayTarget> potentialTargets;
+    for (size_t i = 0, n = serverState.maxConnectedId; i <= n; ++i) {
+      Networking::UserId userId = static_cast<Networking::UserId>(i);
+      if (serverState.IsConnected(userId)) {
+        MpActor* actor = serverState.ActorByUser(userId);
+        if (actor) {
+          try {
+            auto worldOrCell = actor->GetCellOrWorld().ToFormId(worldState.espmFiles);
+            MpParallel::RelayTarget target;
+            target.userId = userId;
+            target.listenerFormId = actor->GetFormId();
+            target.worldOrCell = worldOrCell;
+            auto pos = actor->GetPos();
+            target.pos[0] = pos.x;
+            target.pos[1] = pos.y;
+            target.pos[2] = pos.z;
+            target.chunkX = MpParallel::ToChunkCoord(pos.x);
+            target.chunkY = MpParallel::ToChunkCoord(pos.y);
+            potentialTargets.push_back(target);
+          } catch (const std::exception&) {
+            // Ignore actors with invalid cell/world
+          }
+        }
+      }
+    }
+    pImpl->offloadDispatcher->SetPotentialTargets(std::move(potentialTargets));
     pImpl->offloadDispatcher->ExecuteTick(*pImpl->offloadSink);
   }
 
@@ -1057,20 +1105,34 @@ void PartOne::TickDeferredMessages()
       continue;
     }
     for (auto& channel : userInfo->deferredChannels) {
-      for (auto& message : channel) {
-        auto actor = serverState.ActorByUser(userId);
-        if (!actor) {
-          continue;
-        }
+      if (channel.empty()) {
+        continue;
+      }
+      auto actor = serverState.ActorByUser(userId);
+      if (!actor) {
+        channel.clear();
+        continue;
+      }
 
+      pImpl->deferredDataScratch.clear();
+      pImpl->deferredLengthsScratch.clear();
+
+      bool reliable = channel.front().packetReliable;
+
+      for (auto& message : channel) {
         if (message.actorIdExpected != actor->GetFormId()) {
           continue;
         }
 
-        pImpl->sendTarget->Send(
+        pImpl->deferredDataScratch.push_back(message.packetData.data());
+        pImpl->deferredLengthsScratch.push_back(message.packetData.size());
+      }
+
+      if (!pImpl->deferredDataScratch.empty()) {
+        pImpl->sendTarget->SendList(
           userId,
-          reinterpret_cast<Networking::PacketData>(message.packetData.data()),
-          message.packetData.size(), message.packetReliable);
+          reinterpret_cast<const Networking::PacketData*>(pImpl->deferredDataScratch.data()),
+          pImpl->deferredLengthsScratch.data(), pImpl->deferredDataScratch.size(), reliable);
       }
       channel.clear();
     }
