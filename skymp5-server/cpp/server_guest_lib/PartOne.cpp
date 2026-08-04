@@ -45,6 +45,15 @@ void PartOneSendTargetWrapper::Send(Networking::UserId targetUserId,
        stream.GetNumberOfBytesUsed(), reliable);
 }
 
+void PartOneSendTargetWrapper::SendList(Networking::UserId targetUserId,
+                                        const Networking::PacketData* dataArray,
+                                        const size_t* lengths, size_t count,
+                                        bool reliable)
+{
+  underlyingSendTarget.SendList(targetUserId, dataArray, lengths, count,
+                                reliable);
+}
+
 class FakeSendTarget : public Networking::ISendTarget
 {
 public:
@@ -65,6 +74,15 @@ public:
     }
 
     messages.push_back(PartOne::Message{ j, message, targetUserId, reliable });
+  }
+
+  void SendList(Networking::UserId targetUserId,
+                const Networking::PacketData* dataArray, const size_t* lengths,
+                size_t count, bool reliable) override
+  {
+    for (size_t i = 0; i < count; ++i) {
+      Send(targetUserId, dataArray[i], lengths[i], reliable);
+    }
   }
 
   std::vector<PartOne::Message> messages;
@@ -98,6 +116,10 @@ struct PartOne::Impl
   bool enableGamemodeDataUpdatesBroadcast = false;
 
   PartOne::OnActorStreamIn onActorStreamIn;
+
+  // Reused across TickDeferredMessages calls to avoid allocations on the hot path
+  std::vector<const uint8_t*> deferredDataScratch;
+  std::vector<size_t> deferredLengthsScratch;
 
   // Always present, but does nothing until ConfigureParallelism turns it on.
   std::unique_ptr<MpParallel::OffloadDispatcher> offloadDispatcher;
@@ -1083,20 +1105,34 @@ void PartOne::TickDeferredMessages()
       continue;
     }
     for (auto& channel : userInfo->deferredChannels) {
-      for (auto& message : channel) {
-        auto actor = serverState.ActorByUser(userId);
-        if (!actor) {
-          continue;
-        }
+      if (channel.empty()) {
+        continue;
+      }
+      auto actor = serverState.ActorByUser(userId);
+      if (!actor) {
+        channel.clear();
+        continue;
+      }
 
+      pImpl->deferredDataScratch.clear();
+      pImpl->deferredLengthsScratch.clear();
+
+      bool reliable = channel.front().packetReliable;
+
+      for (auto& message : channel) {
         if (message.actorIdExpected != actor->GetFormId()) {
           continue;
         }
 
-        pImpl->sendTarget->Send(
+        pImpl->deferredDataScratch.push_back(message.packetData.data());
+        pImpl->deferredLengthsScratch.push_back(message.packetData.size());
+      }
+
+      if (!pImpl->deferredDataScratch.empty()) {
+        pImpl->sendTarget->SendList(
           userId,
-          reinterpret_cast<Networking::PacketData>(message.packetData.data()),
-          message.packetData.size(), message.packetReliable);
+          reinterpret_cast<const Networking::PacketData*>(pImpl->deferredDataScratch.data()),
+          pImpl->deferredLengthsScratch.data(), pImpl->deferredDataScratch.size(), reliable);
       }
       channel.clear();
     }
