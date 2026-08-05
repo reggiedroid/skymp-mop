@@ -544,6 +544,43 @@ TEST_CASE("A changing population moves the optimum", "[.][ParallelBench]")
   REQUIRE(best > 0.0);
 }
 
+TEST_CASE("Cost of a wrong offload threshold, in both directions",
+          "[.][ParallelBench]")
+{
+  // minActorsToOffload is a break-even measured on one machine, so the useful
+  // question for anything that tunes it is how much it costs to be wrong --
+  // and whether the penalty is symmetric. If it is not, a controller should
+  // be biased toward the cheap side rather than trying to sit exactly on the
+  // boundary.
+  constexpr int kTicks = 150;
+  std::printf("\n  us/tick by minActorsToOffload\n\n");
+  std::printf("  %-8s %10s", "players", "inline");
+  for (size_t t : { size_t(1), size_t(100), size_t(300), size_t(100000) }) {
+    std::printf(" %9zu", t);
+  }
+  std::printf("\n  %s\n", std::string(58, '-').c_str());
+
+  for (int players : { 50, 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("  %-8d %9.1f", players, baseline.perTickMicros);
+
+    for (size_t threshold : { size_t(1), size_t(100), size_t(300),
+                              size_t(100000) }) {
+      MpParallel::ParallelConfig config = MakeConfig(0);
+      config.minActorsToOffload = threshold;
+      config.Normalize();
+      const double total =
+        RunLoadProfile({ { kTicks, players } }, players, true, config);
+      std::printf(" %9.1f", total / kTicks);
+    }
+    std::printf("\n");
+  }
+  // 100000 is "never offload": the snapshot is still built and the relay
+  // decisions still made, just on the calling thread. It isolates what the
+  // feature costs when the pool is switched off but the machinery is not.
+  std::printf("\n  (100000 = pool never engages; snapshot still built)\n\n");
+}
+
 TEST_CASE("Parallel offload scaling by worker count", "[.][ParallelBench]")
 {
   // This is where the auto-detect default comes from. More workers is not
