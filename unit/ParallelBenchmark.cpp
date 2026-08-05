@@ -381,6 +381,76 @@ TEST_CASE("Shard granularity: how small a work unit still pays",
   std::printf("\n  (cell is us/tick and work-unit count)\n\n");
 }
 
+// One segment of a load profile: hold this many senders for this many ticks.
+struct LoadSegment
+{
+  int ticks = 0;
+  int activePlayers = 0;
+};
+
+// Drives a population that changes over time, which is what any setting tuned
+// once cannot follow.
+//
+// Every player stays connected throughout -- so the recipient set, and
+// therefore the per-sender work, is constant -- and only the number of them
+// sending movement each tick varies. That is the quantity the shard budget is
+// derived from, so it is what moves the optimum.
+//
+// Returns total wall clock for the whole profile, in microseconds. Totals
+// rather than per-tick averages because segments differ in length and the
+// question is which configuration finishes the whole shift faster.
+double RunLoadProfile(const std::vector<LoadSegment>& profile, int totalPlayers,
+                      bool parallel, const MpParallel::ParallelConfig& config)
+{
+  PartOne partOne;
+  NullSendTarget sendTarget;
+  partOne.SetSendTarget(&sendTarget);
+
+  if (parallel) {
+    partOne.ConfigureParallelism(config);
+  }
+
+  const int side = static_cast<int>(
+    std::ceil(std::sqrt(static_cast<double>(totalPlayers))));
+  const float spacing = 3800.f / static_cast<float>(std::max(side - 1, 1));
+  auto posX = [&](int i) { return static_cast<float>(i % side) * spacing; };
+  auto posY = [&](int i) { return static_cast<float>(i / side) * spacing; };
+
+  std::vector<uint32_t> idx(totalPlayers);
+  for (int i = 0; i < totalPlayers; ++i) {
+    DoConnect(partOne, static_cast<Networking::UserId>(i));
+    const uint32_t formId = 0xff000000 + static_cast<uint32_t>(i);
+    partOne.CreateActor(formId, { posX(i), posY(i), 0.f }, 0.f, 0x3c);
+    partOne.SetUserActor(static_cast<Networking::UserId>(i), formId);
+    idx[i] = dynamic_cast<MpActor*>(
+               partOne.worldState.LookupFormById(formId).get())
+               ->GetIdx();
+  }
+
+  auto oneTick = [&](int active) {
+    for (int i = 0; i < active; ++i) {
+      SendBinaryMovement(partOne, static_cast<Networking::UserId>(i), idx[i],
+                         posX(i) + 1.f, posY(i) + 1.f);
+    }
+    partOne.Tick();
+  };
+
+  // Warm up at the profile's first level so allocator growth and subscription
+  // setup are not charged to the measurement.
+  for (int w = 0; w < 10; ++w) {
+    oneTick(profile.empty() ? totalPlayers : profile.front().activePlayers);
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  for (const LoadSegment& segment : profile) {
+    for (int t = 0; t < segment.ticks; ++t) {
+      oneTick(segment.activePlayers);
+    }
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  return std::chrono::duration<double, std::micro>(elapsed).count();
+}
+
 TEST_CASE("Idle threads: does pool size cost anything on its own?",
           "[.][ParallelBench]")
 {
@@ -419,6 +489,59 @@ TEST_CASE("Idle threads: does pool size cost anything on its own?",
     }
   }
   std::printf("\n");
+}
+
+TEST_CASE("A changing population moves the optimum", "[.][ParallelBench]")
+{
+  // The premise behind tuning anything at run time: no single fixed shard
+  // budget is best across a population that moves. If this prints a single
+  // column that wins every segment, adaptive tuning has nothing to chase and
+  // the fixed defaults should stay.
+  //
+  // The profile is a raid forming and dispersing: quiet, ramp, packed, ramp
+  // back down.
+  const std::vector<LoadSegment> profile = {
+    { 200, 40 },  { 150, 120 }, { 200, 300 },
+    { 300, 400 }, { 150, 120 }, { 200, 40 },
+  };
+
+  int totalTicks = 0;
+  for (const LoadSegment& s : profile) {
+    totalTicks += s.ticks;
+  }
+
+  std::printf("\n  one raid cycle (%d ticks, 40 -> 400 -> 40 senders)\n\n",
+              totalTicks);
+  std::printf("  %-16s %12s %10s\n", "maxShards", "total ms", "us/tick");
+  std::printf("  %s\n", std::string(42, '-').c_str());
+
+  double best = 0.0;
+  size_t bestShards = 0;
+  for (size_t shards : { size_t(2), size_t(4), size_t(8), size_t(16),
+                         size_t(32) }) {
+    MpParallel::ParallelConfig config = MakeConfig(0);
+    config.maxShardsPerCluster = shards;
+    config.minShardMicros = 1;
+    config.Normalize();
+
+    const double total = RunLoadProfile(profile, 400, true, config);
+    std::printf("  %-16zu %12.1f %10.1f\n", shards, total / 1000.0,
+                total / totalTicks);
+    if (best == 0.0 || total < best) {
+      best = total;
+      bestShards = shards;
+    }
+  }
+
+  MpParallel::ParallelConfig off;
+  off.enabled = false;
+  const double inlineTotal = RunLoadProfile(profile, 400, false, off);
+  std::printf("  %-16s %12.1f %10.1f\n", "inline", inlineTotal / 1000.0,
+              inlineTotal / totalTicks);
+  std::printf("\n  best fixed ceiling over the whole cycle: %zu shards\n\n",
+              bestShards);
+
+  REQUIRE(best > 0.0);
 }
 
 TEST_CASE("Parallel offload scaling by worker count", "[.][ParallelBench]")
