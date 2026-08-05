@@ -21,8 +21,23 @@ struct ParallelConfig
 {
   bool enabled = false;
 
+  // Dynamically tune minActorsToOffload during runtime based on actual 
+  // execution metrics. Defaults to true as the penalty for configuring
+  // minActorsToOffload too high is heavily asymmetric.
+  bool adaptiveParallelism = true;
+
+  // The overhead tolerance factor. E.g. 1.05 means we allow parallel execution
+  // to be up to 5% slower than the sequential estimate before bailing out.
+  float adaptiveBias = 1.05f;
+
+  // How frequently (in ticks) we slowly decay the threshold to probe offloading again.
+  uint32_t adaptiveDecayTicks = 10;
+
+  // The minimum minActorsToOffload we will ever decay down to.
+  size_t adaptiveThresholdFloor = 30;
+
   // 0 means "auto": an estimate of physical cores minus one for the Node/V8
-  // main thread, capped at 8. See kMaxAutoWorkerThreads in ParallelConfig.cpp
+  // main thread, capped at kMaxAutoWorkerThreads (8). See ParallelConfig.cpp
   // for why the cap is there and what it was measured against -- past it,
   // more threads made the tick markedly slower rather than faster. An
   // explicit value here is bounded only by kMaxWorkerThreads.

@@ -105,6 +105,12 @@ void ParallelConfig::Normalize()
   // the whole frame, which is the failure mode this is meant to avoid.
   workerSpinMicros = std::min<uint32_t>(workerSpinMicros, 5000);
 
+  // Prevent division-by-zero in the adaptive decay modulo check.
+  adaptiveDecayTicks = std::max<uint32_t>(adaptiveDecayTicks, 1);
+  // A bias below 1.0 would permanently disable offloading.
+  adaptiveBias = std::max(adaptiveBias, 1.0f);
+  adaptiveThresholdFloor = std::max<size_t>(adaptiveThresholdFloor, 1);
+
   if (targetTickBudgetMicros == 0) {
     targetTickBudgetMicros = 8000;
   }
@@ -135,6 +141,14 @@ ParallelConfig ParallelConfig::FromServerSettings(
   const nlohmann::json& j = *it;
 
   config.enabled = ReadBool(j, "enabled", config.enabled);
+  config.adaptiveParallelism =
+    ReadBool(j, "adaptiveParallelism", config.adaptiveParallelism);
+  config.adaptiveBias =
+    ReadNumber<float>(j, "adaptiveBias", config.adaptiveBias);
+  config.adaptiveDecayTicks =
+    ReadNumber<uint32_t>(j, "adaptiveDecayTicks", config.adaptiveDecayTicks);
+  config.adaptiveThresholdFloor =
+    ReadNumber<size_t>(j, "adaptiveThresholdFloor", config.adaptiveThresholdFloor);
   config.adaptiveThrottling =
     ReadBool(j, "adaptiveThrottling", config.adaptiveThrottling);
   config.interestManagement =
@@ -182,11 +196,11 @@ std::string ParallelConfig::Describe() const
   }
   return fmt::format(
     "parallel area offload: enabled, workerThreads={}, "
-    "minActorsToOffload={}, minClusterActors={}, minShardActors={}, "
+    "minActorsToOffload={}, adaptiveParallelism={}, minClusterActors={}, minShardActors={}, "
     "minShardMicros={}, spin={}us, separation={} chunks, "
     "interestManagement={} (fullRate={}u, maxSkip={}), "
     "adaptiveThrottling={}, budget={}us",
-    workerThreads, minActorsToOffload, minClusterActors, minShardActors,
+    workerThreads, minActorsToOffload, adaptiveParallelism ? "on" : "off", minClusterActors, minShardActors,
     minShardMicros, workerSpinMicros, clusterSeparationChunks,
     interestManagement ? "on" : "off", interestFullRateUnits,
     maxInterestSkipTicks, adaptiveThrottling ? "on" : "off",

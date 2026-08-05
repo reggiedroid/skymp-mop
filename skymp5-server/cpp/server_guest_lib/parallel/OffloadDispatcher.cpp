@@ -42,6 +42,7 @@ OffloadDispatcher::OffloadDispatcher(const ParallelConfig& config_)
   : config(config_)
 {
   config.Normalize();
+  currentMinActorsToOffload = config.minActorsToOffload;
   ResetPool();
 }
 
@@ -75,6 +76,7 @@ void OffloadDispatcher::Reconfigure(const ParallelConfig& newConfig)
   // size the first shards after a reconfigure from measurements of a
   // different configuration.
   microsPerActorEma = 0.0;
+  currentMinActorsToOffload = config.minActorsToOffload;
   ResetPool();
 }
 
@@ -234,6 +236,23 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   RunUnits();
   JoinResults(sink);
 
+  if (config.adaptiveParallelism) {
+    if (lastTickOffloaded) {
+      uint64_t parallelWall = metrics.lastParallelMicros + metrics.lastJoinMicros;
+      // Use the bias to favor offloading due to asymmetric penalty
+      if (parallelWall > metrics.lastAggregateTaskMicros * config.adaptiveBias) {
+        // Offload was slower than sequential would have been. Back off quickly.
+        currentMinActorsToOffload = snapshot.actors.size() + 10;
+      }
+    } else {
+      // Slowly decay the threshold to probe offloading again.
+      if (snapshot.tickIndex % config.adaptiveDecayTicks == 0 &&
+          currentMinActorsToOffload > config.adaptiveThresholdFloor) {
+        currentMinActorsToOffload--;
+      }
+    }
+  }
+
   if (pool) {
     const uint64_t failed = pool->GetFailedTaskCount();
     if (failed > lastFailedTaskCount) {
@@ -350,7 +369,7 @@ void OffloadDispatcher::RunUnits()
   const uint64_t parallelStart = NowMicros();
 
   const bool offload = pool && pool->GetWorkerCount() > 0 &&
-    snapshot.actors.size() >= config.minActorsToOffload;
+    snapshot.actors.size() >= currentMinActorsToOffload;
   lastTickOffloaded = offload;
 
   if (offload) {

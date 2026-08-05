@@ -246,6 +246,11 @@ private:
   // prime. Starts at 0 so the very first tick primes nothing and simply pays
   // the wakeup.
   size_t lastPooledUnitEstimate = 0;
+
+  // Adaptive threshold for the number of actors required to offload to the pool.
+  // Initially matches config.minActorsToOffload, but can be scaled dynamically
+  // if adaptiveParallelism is enabled.
+  size_t currentMinActorsToOffload = 0;
 };
 
 }
