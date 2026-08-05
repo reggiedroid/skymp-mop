@@ -105,7 +105,7 @@ def simulate_inline(players, hw, interest_mgmt=False):
 
 
 def simulate_parallel(players, hw, interest_mgmt=True, min_shard_micros=20,
-                      verbose=False):
+                      worker_override=None, verbose=False):
     """Predict tick cost with the parallel OffloadDispatcher."""
     neighbors = compute_neighbors(players, interest_mgmt)
     edges = players * neighbors
@@ -122,7 +122,10 @@ def simulate_parallel(players, hw, interest_mgmt=True, min_shard_micros=20,
     t_task_total = c_task_edge * edges
 
     # Auto worker count: min(physical - 1, kMaxAutoWorkerThreads=8)
-    workers = min(hw.physical_cores - 1, 8)
+    if worker_override is not None:
+        workers = worker_override
+    else:
+        workers = min(hw.physical_cores - 1, 8)
     workers = max(workers, 1)
 
     # Shard count: estimated_work / min_shard_micros, capped at 2*workers
@@ -131,7 +134,11 @@ def simulate_parallel(players, hw, interest_mgmt=True, min_shard_micros=20,
     active = min(workers, shards)
 
     if active > 1 and players >= 100:  # minActorsToOffload default
-        t_parallel_wall = (t_task_total / active) + barrier
+        # The barrier cost is paid once for the round-trip, but there is also a small
+        # serial dispatch overhead (waking workers, pulling from the queue) per shard.
+        # Derived empirically to match the 20us optimum at 150 players.
+        per_shard_overhead = 1.5 * hw.barrier_scale
+        t_parallel_wall = (t_task_total / active) + barrier + (shards * per_shard_overhead)
     else:
         t_parallel_wall = t_task_total  # runs inline, no barrier
 
@@ -158,6 +165,25 @@ def find_max_players(simulate_fn, hw, target_ms=16.66, **kwargs):
     return best
 
 
+def optimize_parameters(hw, players=400):
+    best_cost = float('inf')
+    best_shard = 20
+    best_workers = 8
+
+    # Ensure we cap workers search space up to the hardware's physical cores
+    max_workers_to_test = min(hw.physical_cores, 32)
+
+    for shard_micros in range(5, 105, 5):
+        for test_workers in range(1, max_workers_to_test + 1):
+            cost = simulate_parallel(players, hw, interest_mgmt=True,
+                                     min_shard_micros=shard_micros,
+                                     worker_override=test_workers)
+            if cost < best_cost:
+                best_cost = cost
+                best_shard = shard_micros
+                best_workers = test_workers
+                
+    return best_shard, best_workers, best_cost
 def validate_against_benchmarks():
     """Compare model predictions to actual benchmark measurements."""
     hw = PROFILES[0]  # Ryzen baseline
@@ -201,7 +227,10 @@ def project_hardware():
         max_inline = find_max_players(simulate_inline, hw, interest_mgmt=False)
         max_par_im = find_max_players(simulate_parallel, hw, interest_mgmt=True)
         cost_400   = simulate_parallel(400, hw, interest_mgmt=True)
+        opt_shard, opt_workers, opt_cost = optimize_parameters(hw, 400)
+        
         print(f"  {hw.name:<40} {hw.physical_cores:>5} {max_inline:>9} p {max_par_im:>9} p {cost_400/1000:>8.2f} ms")
+        print(f"      -> Optimal @400: shard={opt_shard}us, workers={opt_workers}, cost={opt_cost/1000:.2f}ms")
 
     print()
 
