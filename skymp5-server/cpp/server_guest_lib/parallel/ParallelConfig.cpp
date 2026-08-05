@@ -5,6 +5,16 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#elif defined(__linux__)
+#include <fstream>
+#include <string>
+#include <unordered_set>
+#endif
 
 namespace MpParallel {
 
@@ -74,19 +84,71 @@ bool ReadBool(const nlohmann::json& obj, const char* key, bool fallback)
   return it->get<bool>();
 }
 
+size_t GetPhysicalCoreCount()
+{
+  size_t fallback = std::thread::hardware_concurrency();
+  
+#ifdef _WIN32
+  DWORD length = 0;
+  GetLogicalProcessorInformation(nullptr, &length);
+  if (length == 0 && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+    return fallback > 1 ? fallback / 2 : 1;
+  }
+
+  std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> buffer(
+    length / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+  if (!GetLogicalProcessorInformation(buffer.data(), &length)) {
+    return fallback > 1 ? fallback / 2 : 1;
+  }
+
+  size_t physicalCores = 0;
+  for (const auto& info : buffer) {
+    if (info.Relationship == RelationProcessorCore) {
+      physicalCores++;
+    }
+  }
+  return physicalCores > 0 ? physicalCores : (fallback > 1 ? fallback / 2 : 1);
+#elif defined(__linux__)
+  // Read /proc/cpuinfo and count unique core ids
+  std::ifstream cpuinfo("/proc/cpuinfo");
+  if (!cpuinfo.is_open()) {
+    return fallback > 1 ? fallback / 2 : 1;
+  }
+  std::unordered_set<std::string> cores;
+  std::string line;
+  std::string currentPhysicalId = "";
+  std::string currentCoreId = "";
+  
+  while (std::getline(cpuinfo, line)) {
+    if (line.find("physical id") == 0) {
+      size_t pos = line.find(":");
+      if (pos != std::string::npos) currentPhysicalId = line.substr(pos + 1);
+    } else if (line.find("core id") == 0) {
+      size_t pos = line.find(":");
+      if (pos != std::string::npos) currentCoreId = line.substr(pos + 1);
+    } else if (line.empty()) {
+      if (!currentPhysicalId.empty() && !currentCoreId.empty()) {
+        cores.insert(currentPhysicalId + "-" + currentCoreId);
+      }
+      currentPhysicalId = "";
+      currentCoreId = "";
+    }
+  }
+  return cores.size() > 0 ? cores.size() : (fallback > 1 ? fallback / 2 : 1);
+#else
+  return fallback > 1 ? fallback / 2 : 1;
+#endif
+}
+
 }
 
 void ParallelConfig::Normalize()
 {
   if (workerThreads == 0) {
-    // hardware_concurrency counts logical processors, so on an SMT machine
-    // half of them share execution units with the other half. A worker here
-    // alternates between a pause loop and streaming writes, which is close to
-    // the worst case for an SMT sibling, so the estimate is in physical
-    // cores. One of those is then left for the Node/V8 thread that drives
-    // ScampServer::Tick.
-    const size_t detected = std::thread::hardware_concurrency();
-    const size_t physical = detected > 1 ? detected / 2 : 1;
+    // Determine the actual number of physical cores via OS APIs to properly
+    // support processors without HyperThreading, such as Intel E-cores or ARM.
+    // One core is left for the Node/V8 thread that drives ScampServer::Tick.
+    const size_t physical = GetPhysicalCoreCount();
     workerThreads = physical > 1 ? physical - 1 : 1;
     workerThreads = std::min(workerThreads, kMaxAutoWorkerThreads);
   }
