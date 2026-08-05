@@ -92,22 +92,56 @@ on faith:
 
 Every player in one chunk, everyone sending movement every tick, timing the
 full ingest **plus** `PartOne::Tick` so both paths are compared over the same
-unit of work. 32-core host, binary wire format:
+unit of work. 16-core/32-thread Ryzen 9950X3D, binary wire format:
 
 | players | 25 | 50 | 100 | 150 | 250 | 400 |
 | --- | --- | --- | --- | --- | --- | --- |
-| speedup | 0.25× | 0.43× | 0.66× | 0.81× | 0.88× | **1.10×** |
+| speedup | 0.85× | 0.88× | 0.99× | **1.29×** | **1.87×** | **2.17×** |
 
-**Break-even is around 300–400 players.** Below that the offload is a
-regression: barrier and snapshot costs are paid every tick while the parallel
-phase is still small. That is why `minActorsToOffload` defaults to 300 rather
-than to something optimistic.
+**Break-even is around 100 players**, and `minActorsToOffload` defaults to 100.
 
-The parallel phase itself scales fine — at 400 players it completes 966µs of
-task work in 96µs of wall clock, roughly 10×. The ceiling is elsewhere: the
-join emits 160,000 relays serially and costs 787µs of an 1118µs tick, *even
-with a send target that does nothing*. Parallelising decisions cannot fix
-that. Sending fewer relays can, which is what interest management is for.
+It used to be around 300–400 (0.25×/0.43×/0.66×/0.81×/0.88×/1.10× for the same
+populations). The parallel phase was never the problem — it was already small.
+Three serial costs around it were:
+
+- **The barrier.** Workers blocked on a condition variable between ticks, so
+  every tick paid a wakeup for every worker. At 25 players the parallel phase
+  measured 55µs of wall clock for 5µs of task work. Workers are now told a
+  batch is coming when the *first packet of the tick arrives*, so they wake
+  during ingest instead of at the barrier, and `Run` waits on the tasks rather
+  than on the threads — a four-task batch costs four wakeups, not thirty.
+- **The join.** One virtual call per relay edge, each of which re-resolved the
+  send target (a pointer chase and a throw-if-null) and re-checked the
+  recipient's connection. All three are loop invariants. The sink now takes a
+  whole work unit's relay list in one call: 18 calls a tick at 400 players
+  instead of 160,000.
+- **Shard sizing.** Shards were sized by actor count, which produced 50 work
+  units for 150 actors — three actors each, far below what a scheduler round
+  trip costs. They are now sized by measured work.
+
+The remaining ceiling is still the join: at 400 players it emits 160,000
+relays serially for 275µs of a 551µs tick, *even with a send target that does
+nothing*. Parallelising decisions cannot fix that. Sending fewer relays can,
+which is what interest management is for.
+
+### Worker count is not "as many as the machine has"
+
+Measured at 400 players against a 1196µs inline baseline:
+
+| workers | 4 | 6 | 8 | 12 | 16 | 24 |
+| --- | --- | --- | --- | --- | --- | --- |
+| speedup | 2.04× | 2.18× | **2.19×** | 1.56× | 1.58× | 1.56× |
+
+The cliff between 8 and 12 is topology, not scheduling: that part is two
+8-core chiplets with separate L3, and a pool that fits inside one of them
+keeps the relay buffers in a cache the join can read back cheaply. It is not
+the unit count — 18 units on 8 workers took 546µs, while 17 units on 30
+workers took 1150µs.
+
+Auto-detect therefore estimates *physical* cores (`hardware_concurrency` counts
+SMT siblings, which share execution units with the threads that would be
+spinning), leaves one for the Node thread, and caps the result at 8. Set
+`workerThreads` explicitly after running the benchmark on your own hardware.
 
 Clusters still matter. They are what makes each shard's recipient set and
 pressure level well defined, and they let two distant crowds be costed
@@ -181,10 +215,12 @@ Add a `parallelism` object to `server-settings.json`:
   "parallelism": {
     "enabled": true,
     "workerThreads": 0,
-    "minActorsToOffload": 300,
+    "minActorsToOffload": 100,
     "minClusterActors": 4,
     "minShardActors": 4,
+    "minShardMicros": 20,
     "maxShardsPerCluster": 0,
+    "workerSpinMicros": 250,
     "clusterSeparationChunks": 4,
     "interestManagement": true,
     "interestFullRateUnits": 2048,
@@ -202,17 +238,18 @@ Add a `parallelism` object to `server-settings.json`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Master switch. Off means the original code path, byte for byte. |
-| `workerThreads` | `0` | `0` auto-detects: cores minus two, reserved for the Node main thread and the async save thread. Capped at 32. |
-| `minActorsToOffload` | `300` | Below this the fork/join barrier costs more than it saves — measured, see the table above. Lowering it makes the server slower. |
+| `workerThreads` | `0` | `0` auto-detects: estimated physical cores minus one for the Node thread, capped at **8**. More is not better — see the worker-count table above. An explicit value is capped at 32. |
+| `minActorsToOffload` | `100` | Below this the thread pool costs more than it saves — measured, see the table above. Note it only gates the pool: packets are still flattened into the snapshot, so below it the feature buys interest management and costs a few percent of tick time. |
 | `interestManagement` | `true` | Distance-based update-rate reduction, always on. The highest-value setting here. |
 | `interestFullRateUnits` | `2048` | Recipients closer than this always get every update. |
 | `maxInterestSkipTicks` | `4` | Ceiling on how far apart interest management may space an update. |
 | `minClusterActors` | `4` | Clusters smaller than this are swept up on the main thread instead of getting their own task. |
-| `minShardActors` | `4` | Fewest players a shard of a crowded cluster may carry. Lower splits a crowd more finely; too low and per-task overhead starts to show. |
-| `maxShardsPerCluster` | `0` | `0` auto-sizes to twice the slot count. Raise only if profiling shows one area still bottlenecking. |
+| `minShardActors` | `4` | Fewest players a shard of a crowded cluster may carry. A floor under the work-based sizing below. |
+| `minShardMicros` | `20` | Least *estimated work* that justifies a separate shard, from the per-actor cost previous ticks actually took. This is what stops a quiet tick being cut into fifty three-actor pieces. Measured; see the `Shard granularity` benchmark case. |
+| `maxShardsPerCluster` | `0` | `0` auto-sizes to twice the slot count, as a ceiling on the work-based count. Raise only if profiling shows one area still bottlenecking. |
+| `workerSpinMicros` | `250` | How long a primed worker stays hot waiting for the batch. Sized to cover packet ingest, which is the gap it bridges. `0` restores pure blocking. Workers never spin between ticks. |
 | `clusterSeparationChunks` | `4` | Chunk distance separating clusters. Clamped up to 3. Raise it if you want more margin, at the cost of merging nearby crowds. |
 | `maxWorkUnitsPerTick` | `0` | `0` is unlimited. Units past the limit run on the calling thread. |
-| `repartitionIntervalTicks` | `30` | Reserved for incremental repartitioning. |
 | `adaptiveThrottling` | `true` | Enables the degradation described above. Only ever activates under measured overload. |
 | `targetTickBudgetMicros` | `8000` | Wall-clock target for the parallel phase. Overshooting raises pressure. |
 | `throttleDistanceUnits` | `4096` | Relays closer than this are never throttled. One exterior cell. |
@@ -243,10 +280,13 @@ MpParallel: tick=5000 actors=214 clusters=37 biggest=151 units=58 (pooled 54)
   offload is buying nothing — usually because `minActorsToOffload` is never
   reached.
 - `biggest` against `actors` tells you how concentrated your population is. When
-  `biggest` is most of `actors`, sharding is doing the work, and `units` should
-  be comfortably larger than `clusters`. If it is not, lower `minShardActors`.
+  `biggest` is most of `actors`, sharding is doing the work.
+- `units` is now sized by measured work, so a small number on a quiet tick is
+  correct rather than a symptom. One unit means the tick skipped the barrier
+  entirely, which is what you want at low population.
 - `join` growing toward `parallel` means the serial tail is becoming the limit;
-  more cores will not help past that point.
+  more cores will not help past that point. Turn `interestManagement` up
+  instead — lower `interestFullRateUnits` or raise `maxInterestSkipTicks`.
 
 ## One deliberate behavioural difference
 
@@ -334,19 +374,25 @@ Two suites are worth knowing about specifically:
   could return while the worker that ran the final task was still spinning on
   the task cursor. The next tick reset that cursor, so the straggler could
   re-run a task from the previous batch and decrement a counter it did not
-  belong to. The observed failure mode is worse than a duplicated packet:
-  `tasksRemaining` underflows and the barrier never releases, hanging the
-  server tick. The pool now also waits for every drainer to leave, not just
-  for the task count to reach zero.
+  belong to. The observed failure mode is worse than a duplicated packet: the
+  outstanding-task counter underflowed and the barrier never released, hanging
+  the server tick.
+
+  The fix is now structural rather than a second wait condition. The cursor
+  holds the batch generation in its high 32 bits and the next task index in
+  its low 32, and a worker claims work with a single compare-exchange over
+  both. A straggler either fails the generation test and leaves, or fails the
+  exchange because the word moved under it and retries into the same test — it
+  cannot consume an index belonging to a batch it is not part of. That also
+  means `Run` no longer has to wait for threads at all, only for the tasks it
+  published, which is what makes a four-task batch cost four wakeups on a
+  thirty-worker pool instead of thirty.
 
   `Alternating batch sizes stay consistent` is the test that actually catches
   it — a long batch followed by a one-task batch is what leaves a worker
-  draining across the boundary. Verified by reverting the fix and inserting a
-  300us delay at the end of the drain loop: that build hangs on this test in
-  3 of 3 runs, while the fixed build passes in 3 of 3. The natural window is
-  only a few instructions wide, so without the delay neither build fails —
-  this test is a guard against regression under load, not a reliable detector
-  on an idle machine.
+  draining across the boundary. The natural window is only a few instructions
+  wide, so this test is a guard against regression under load, not a reliable
+  detector on an idle machine.
 - `[ParallelOffload]` asserts that sharding is behaviour-neutral: the same
   population processed as one unit and as sixteen produces byte-identical
   relay sequences, in the same order.

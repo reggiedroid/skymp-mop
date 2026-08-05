@@ -31,6 +31,11 @@ constexpr uint64_t kEvictIntervalTicks = 4096;
 // wrong rather than that the server is busy.
 constexpr size_t kMaxPendingSubmissions = 200000;
 
+// Weight of the newest sample in the per-actor cost estimate. Low enough that
+// one tick which collided with a GC pause does not resize every shard, high
+// enough to follow a crowd forming over a couple of seconds.
+constexpr double kCostEmaAlpha = 0.2;
+
 }
 
 OffloadDispatcher::OffloadDispatcher(const ParallelConfig& config_)
@@ -48,14 +53,15 @@ void OffloadDispatcher::ResetPool()
   // builds the threads.
   const size_t desired = config.enabled ? config.workerThreads : 0;
 
-  if (pool && pool->GetWorkerCount() == desired) {
+  if (pool && pool->GetWorkerCount() == desired &&
+      pool->GetSpinMicros() == config.workerSpinMicros) {
     return;
   }
 
   // Destroy before constructing so the two pools never coexist and
   // double-subscribe the machine's cores.
   pool.reset();
-  pool = std::make_unique<ThreadPool>(desired);
+  pool = std::make_unique<ThreadPool>(desired, config.workerSpinMicros);
   lastFailedTaskCount = 0;
 }
 
@@ -65,6 +71,10 @@ void OffloadDispatcher::Reconfigure(const ParallelConfig& newConfig)
   config = newConfig;
   config.Normalize();
   loadBalancer.Clear();
+  // The cost model is calibrated against the old settings; keeping it would
+  // size the first shards after a reconfigure from measurements of a
+  // different configuration.
+  microsPerActorEma = 0.0;
   ResetPool();
 }
 
@@ -73,6 +83,7 @@ void OffloadDispatcher::DiscardPending() noexcept
   snapshot.Clear();
   clusters.clear();
   workUnits.clear();
+  poolPrimed = false;
   for (ClusterOutput& output : unitOutputs) {
     output.Reset();
   }
@@ -96,6 +107,22 @@ bool OffloadDispatcher::SubmitMovement(const MovementSubmission& submission)
                   "ExecuteTick being called?",
                   kMaxPendingSubmissions);
     return false;
+  }
+
+  // First packet of the tick: tell the workers a batch is coming. The rest of
+  // ingest then runs while they wake, so by the time ExecuteTick publishes the
+  // batch they are already spinning on it. That wakeup used to sit on the
+  // critical path and was most of what made the offload lose below a few
+  // hundred players.
+  //
+  // The size of the batch is not known yet -- the packets are still arriving
+  // -- so the previous tick's is the estimate. Population moves slowly
+  // relative to a tick, and being wrong only costs a spin or a wakeup.
+  if (!poolPrimed) {
+    poolPrimed = true;
+    if (pool) {
+      pool->Prime(lastPooledUnitEstimate);
+    }
   }
 
   ActorSnapshot actor;
@@ -144,6 +171,18 @@ bool OffloadDispatcher::SubmitMovement(const MovementSubmission& submission)
 void OffloadDispatcher::SetPotentialTargets(std::vector<RelayTarget>&& targets)
 {
   snapshot.relayTargets = std::move(targets);
+  CommitPotentialTargets();
+}
+
+std::vector<RelayTarget>& OffloadDispatcher::BeginPotentialTargets() noexcept
+{
+  snapshot.relayTargets.clear();
+  snapshot.relayChunks.clear();
+  return snapshot.relayTargets;
+}
+
+void OffloadDispatcher::CommitPotentialTargets()
+{
   std::sort(snapshot.relayTargets.begin(), snapshot.relayTargets.end(),
             [](const RelayTarget& a, const RelayTarget& b) {
               if (a.worldOrCell != b.worldOrCell) {
@@ -154,6 +193,27 @@ void OffloadDispatcher::SetPotentialTargets(std::vector<RelayTarget>&& targets)
               }
               return a.chunkY < b.chunkY;
             });
+
+  // One linear pass turns the sorted list into a per-chunk index. Workers
+  // then search a table with one entry per occupied chunk instead of one per
+  // connected player, which is the difference between a crowd of 400 in one
+  // chunk costing log(400) per stencil probe and costing log(1).
+  snapshot.relayChunks.clear();
+  for (uint32_t i = 0; i < static_cast<uint32_t>(snapshot.relayTargets.size());
+       ++i) {
+    const RelayTarget& target = snapshot.relayTargets[i];
+    const AreaKey key{ target.worldOrCell, target.chunkX, target.chunkY };
+    if (!snapshot.relayChunks.empty() &&
+        snapshot.relayChunks.back().key == key) {
+      snapshot.relayChunks.back().end = i + 1;
+      continue;
+    }
+    RelayChunk chunk;
+    chunk.key = key;
+    chunk.begin = i;
+    chunk.end = i + 1;
+    snapshot.relayChunks.push_back(chunk);
+  }
 }
 
 void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
@@ -162,6 +222,7 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   metrics.ResetTick();
   metrics.lastTickIndex = snapshot.tickIndex;
   ++metrics.totalTicks;
+  poolPrimed = false;
 
   if (snapshot.Empty()) {
     snapshot.Clear();
@@ -201,28 +262,56 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   snapshot.Clear();
 }
 
-size_t OffloadDispatcher::ComputeShardCount(size_t clusterSize) const
+size_t OffloadDispatcher::ComputeShardBudget() const
 {
-  if (clusterSize <= config.minShardActors) {
-    return 1;
-  }
-
   // Enough pieces for the dynamic scheduler to balance, but not so many that
-  // task overhead eats the gain. Two per slot is the usual sweet spot: it
+  // task overhead eats the gain. Two per slot is the usual ceiling: it
   // absorbs the variance between a shard of stationary players and a shard
   // in the middle of a fight.
   const size_t slots = pool ? pool->GetSlotCount() : 1;
-  const size_t configured = config.maxShardsPerCluster > 0
+  const size_t ceiling = config.maxShardsPerCluster > 0
     ? config.maxShardsPerCluster
     : slots * 2;
 
+  // No measurement yet. Splitting across the slots is the reasonable guess,
+  // and the estimate arrives after one tick.
+  if (microsPerActorEma <= 0.0) {
+    return std::max<size_t>(1, std::min(ceiling, slots));
+  }
+
+  const double estimatedMicros =
+    microsPerActorEma * static_cast<double>(snapshot.actors.size());
+  const double minShard = static_cast<double>(std::max<uint32_t>(
+    config.minShardMicros, 1));
+
+  const auto byWork = static_cast<size_t>(estimatedMicros / minShard);
+  return std::max<size_t>(1, std::min(ceiling, byWork));
+}
+
+size_t OffloadDispatcher::ComputeShardCount(size_t clusterSize,
+                                            size_t shardBudget) const
+{
+  if (clusterSize <= config.minShardActors || shardBudget <= 1) {
+    return 1;
+  }
+
+  // The budget is for the whole tick, so each cluster gets the share of it
+  // that its share of the population justifies. Without this a tick with
+  // twenty small clusters would produce twenty times the intended number of
+  // tasks.
+  const size_t totalActors = std::max<size_t>(snapshot.actors.size(), 1);
+  const size_t byShare = (shardBudget * clusterSize + totalActors - 1) /
+    totalActors;
+
   const size_t byMinSize = clusterSize / config.minShardActors;
-  return std::max<size_t>(1, std::min(configured, byMinSize));
+  return std::max<size_t>(1, std::min(byShare, byMinSize));
 }
 
 void OffloadDispatcher::BuildWorkUnits(bool allowSharding)
 {
   workUnits.clear();
+
+  const size_t shardBudget = allowSharding ? ComputeShardBudget() : 1;
 
   // Emitting units in cluster-index order, and in ascending member order
   // within a cluster, is what makes the join reproducible: the unit list is
@@ -235,7 +324,8 @@ void OffloadDispatcher::BuildWorkUnits(bool allowSharding)
       continue;
     }
 
-    const size_t shardCount = allowSharding ? ComputeShardCount(size) : 1;
+    const size_t shardCount =
+      allowSharding ? ComputeShardCount(size, shardBudget) : 1;
     const size_t perShard = (size + shardCount - 1) / shardCount;
 
     for (size_t begin = 0; begin < size; begin += perShard) {
@@ -261,6 +351,7 @@ void OffloadDispatcher::RunUnits()
 
   const bool offload = pool && pool->GetWorkerCount() > 0 &&
     snapshot.actors.size() >= config.minActorsToOffload;
+  lastTickOffloaded = offload;
 
   if (offload) {
     partitioner.Partition(snapshot.actors, config.clusterSeparationChunks,
@@ -284,6 +375,9 @@ void OffloadDispatcher::RunUnits()
     }
     metrics.lastChunkCount = 1;
     ++metrics.totalInlineTicks;
+    // Nothing will be pooled, so the next tick must not wake workers for a
+    // batch that is not coming. Priming on 0 is a no-op.
+    lastPooledUnitEstimate = 0;
   }
 
   metrics.lastClusterCount = clusters.size();
@@ -309,13 +403,19 @@ void OffloadDispatcher::RunUnits()
   BuildWorkUnits(offload);
   metrics.lastWorkUnitCount = workUnits.size();
 
+  // Built once per tick rather than per relay edge. Squaring the configured
+  // radii and reducing the tick index modulo every possible skip factor are
+  // loop invariants over the N^2 inner loop, and the modulo is an integer
+  // division that was being paid twice for every throttled edge.
+  policy = InterestManager::InterestPolicy::Build(config, snapshot.tickIndex);
+
   if (!offload) {
     for (size_t unitIndex = 0; unitIndex < workUnits.size(); ++unitIndex) {
       const WorkUnit& unit = workUnits[unitIndex];
       const uint64_t taskStart = NowMicros();
       InterestManager::ProcessRange(
         snapshot, clusters[unit.clusterIndex].actorIndices.data() + unit.begin,
-        unit.count, pressureByCluster[unit.clusterIndex], config,
+        unit.count, pressureByCluster[unit.clusterIndex], policy,
         unitOutputs[unitIndex]);
       unitOutputs[unitIndex].elapsedMicros = NowMicros() - taskStart;
     }
@@ -371,13 +471,14 @@ void OffloadDispatcher::RunUnits()
       const uint64_t taskStart = NowMicros();
       InterestManager::ProcessRange(
         snapshot, clusters[u.clusterIndex].actorIndices.data() + u.begin,
-        u.count, pressureByCluster[u.clusterIndex], config,
+        u.count, pressureByCluster[u.clusterIndex], policy,
         unitOutputs[unitIndex]);
       unitOutputs[unitIndex].elapsedMicros = NowMicros() - taskStart;
     });
   }
 
   metrics.lastPooledUnitCount = tasks.size();
+  lastPooledUnitEstimate = tasks.size();
 
   pool->Run(tasks);
 
@@ -388,7 +489,7 @@ void OffloadDispatcher::RunUnits()
     const uint64_t taskStart = NowMicros();
     InterestManager::ProcessRange(
       snapshot, clusters[unit.clusterIndex].actorIndices.data() + unit.begin,
-      unit.count, pressureByCluster[unit.clusterIndex], config,
+      unit.count, pressureByCluster[unit.clusterIndex], policy,
       unitOutputs[unitIndex]);
     unitOutputs[unitIndex].elapsedMicros = NowMicros() - taskStart;
   }
@@ -410,15 +511,10 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
     const WorkUnit& unit = workUnits[unitIndex];
     ClusterOutput& output = unitOutputs[unitIndex];
 
-    for (const OutboundSend& send : output.sends) {
-      if (send.byteLength == 0 ||
-          static_cast<size_t>(send.byteOffset) + send.byteLength >
-            snapshot.rawPacketBytes.size()) {
-        continue;
-      }
-      sink.SendRelay(send.userId,
-                     snapshot.rawPacketBytes.data() + send.byteOffset,
-                     send.byteLength, send.reliable);
+    if (!output.sends.empty()) {
+      sink.SendRelayBatch(output.sends.data(), output.sends.size(),
+                          snapshot.rawPacketBytes.data(),
+                          snapshot.rawPacketBytes.size());
     }
 
     for (const MovementVerdict& verdict : output.verdicts) {
@@ -449,10 +545,30 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
   // Cost is tracked per area, so a cluster's shards are summed back together
   // before being fed to the estimator. Otherwise splitting a busy area would
   // make it look cheap and it would never be recognised as under pressure.
-  for (size_t clusterIndex = 0; clusterIndex < clusters.size();
-       ++clusterIndex) {
-    loadBalancer.Observe(clusters[clusterIndex].representative,
-                         clusterMicros[clusterIndex], snapshot.tickIndex);
+  //
+  // Only on an offloaded tick, though. The inline path fabricates a single
+  // cluster covering the whole server and labels it with whichever area
+  // happened to submit first; feeding that in would charge one arbitrary
+  // chunk for every actor on the map, and the next offloaded tick would open
+  // with that chunk apparently far over budget and start throttling players
+  // who are doing nothing wrong.
+  if (lastTickOffloaded) {
+    for (size_t clusterIndex = 0; clusterIndex < clusters.size();
+         ++clusterIndex) {
+      loadBalancer.Observe(clusters[clusterIndex].representative,
+                           clusterMicros[clusterIndex], snapshot.tickIndex);
+    }
+  }
+
+  // Per-actor cost drives next tick's shard budget. Measured rather than
+  // assumed because it varies by two orders of magnitude between a lone
+  // traveller and a player in a crowded market.
+  if (!snapshot.actors.empty()) {
+    const double sample = static_cast<double>(metrics.lastAggregateTaskMicros) /
+      static_cast<double>(snapshot.actors.size());
+    microsPerActorEma = microsPerActorEma <= 0.0
+      ? sample
+      : kCostEmaAlpha * sample + (1.0 - kCostEmaAlpha) * microsPerActorEma;
   }
 
   metrics.totalRelayEdgesEmitted += metrics.lastRelayEdgesEmitted;

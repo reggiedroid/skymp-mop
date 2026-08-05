@@ -56,16 +56,51 @@ void PartOneOffloadSink::SendCorrection(const MpParallel::ActorSnapshot& actor)
   partOne.GetSendTarget().Send(actor.ownerUserId, msg, true);
 }
 
-void PartOneOffloadSink::SendRelay(Networking::UserId userId,
-                                   const uint8_t* data, size_t length,
-                                   bool reliable)
+void PartOneOffloadSink::BeginJoin()
 {
-  // The recipient list was resolved during ingest, so a player who
-  // disconnected in between would otherwise be sent to here.
-  if (!partOne.IsConnected(userId)) {
+  const size_t maxUserId = partOne.serverState.maxConnectedId;
+  connectedBits.assign(maxUserId / 64 + 1, 0);
+
+  for (size_t i = 0; i <= maxUserId; ++i) {
+    const auto userId = static_cast<Networking::UserId>(i);
+    if (partOne.IsConnected(userId)) {
+      connectedBits[i / 64] |= 1ULL << (i % 64);
+    }
+  }
+}
+
+void PartOneOffloadSink::SendRelayBatch(const MpParallel::OutboundSend* sends,
+                                        size_t count,
+                                        const uint8_t* packetBytes,
+                                        size_t packetBytesLength)
+{
+  if (sends == nullptr || packetBytes == nullptr) {
     return;
   }
 
-  partOne.GetSendTarget().Send(
-    userId, reinterpret_cast<Networking::PacketData>(data), length, reliable);
+  // Both hoisted out of the loop. GetSendTarget in particular is a pointer
+  // chase and a throw-if-null, and this loop is the N^2 term of the whole
+  // server.
+  PartOneSendTargetWrapper& sendTarget = partOne.GetSendTarget();
+
+  for (size_t i = 0; i < count; ++i) {
+    const MpParallel::OutboundSend& send = sends[i];
+
+    if (send.byteLength == 0 ||
+        static_cast<size_t>(send.byteOffset) + send.byteLength >
+          packetBytesLength) {
+      continue;
+    }
+
+    // The recipient list is snapshotted at the top of the tick, so a player
+    // who left since then would otherwise be sent to here.
+    if (!IsConnectedFast(send.userId)) {
+      continue;
+    }
+
+    sendTarget.Send(
+      send.userId,
+      reinterpret_cast<Networking::PacketData>(packetBytes + send.byteOffset),
+      send.byteLength, send.reliable);
+  }
 }

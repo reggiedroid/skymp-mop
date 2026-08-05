@@ -177,8 +177,6 @@ bool ActionListener::TrySubmitMovementForOffload(
   MpActor& actor, const RawMessageData& rawMsgData,
   const UpdateMovementMessage& msg, bool teleportFlag)
 {
-  auto& worldState = partOne.worldState;
-
   MpParallel::MovementSubmission submission;
 
   // The offloaded validator compares world/cell form ids numerically instead
@@ -188,7 +186,7 @@ bool ActionListener::TrySubmitMovementForOffload(
   // rejected here rather than throwing out of the packet handler.
   try {
     submission.currentWorldOrCell =
-      actor.GetCellOrWorld().ToFormId(worldState.espmFiles);
+      partOne.ResolveCellOrWorldFormId(actor.GetCellOrWorld());
   } catch (const std::exception&) {
     return false;
   }

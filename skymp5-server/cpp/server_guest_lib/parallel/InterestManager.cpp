@@ -1,11 +1,15 @@
 #include "InterestManager.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace MpParallel {
 namespace InterestManager {
 
 namespace {
+
+constexpr int32_t kInt16Min = std::numeric_limits<int16_t>::min();
+constexpr int32_t kInt16Max = std::numeric_limits<int16_t>::max();
 
 [[nodiscard]] float SqrDistance(const float a[3], const float b[3]) noexcept
 {
@@ -30,6 +34,115 @@ namespace {
   return h;
 }
 
+// Maps a hash uniformly onto [0, range) without a division.
+//
+// Lemire's multiply-shift reduction. The distribution is not perfectly
+// uniform -- some outputs are one 2^-32 slice more likely than others -- but
+// this only picks which tick of a 2-to-4-tick window a pair transmits on, and
+// the bias is far below anything observable there.
+[[nodiscard]] uint32_t ReduceToRange(uint64_t hash, uint32_t range) noexcept
+{
+  const uint64_t product =
+    static_cast<uint64_t>(static_cast<uint32_t>(hash >> 32)) * range;
+  return static_cast<uint32_t>(product >> 32);
+}
+
+}
+
+InterestPolicy InterestPolicy::Build(const ParallelConfig& config,
+                                     uint64_t tickIndex) noexcept
+{
+  InterestPolicy policy;
+  policy.interestManagement = config.interestManagement;
+  policy.adaptiveThrottling = config.adaptiveThrottling;
+
+  const float full = config.interestFullRateUnits;
+  policy.sqrFull = full * full;
+  policy.sqrFull4 = policy.sqrFull * 4.f;
+  policy.sqrFull16 = policy.sqrFull * 16.f;
+
+  const float throttle = config.throttleDistanceUnits;
+  policy.sqrThrottle = throttle * throttle;
+  policy.sqrThrottle4 = policy.sqrThrottle * 4.f;
+  policy.sqrThrottle16 = policy.sqrThrottle * 16.f;
+
+  policy.maxInterestSkip =
+    std::min(std::max<uint32_t>(config.maxInterestSkipTicks, 1), kMaxSkipFactor);
+  policy.maxThrottleSkip =
+    std::min(std::max<uint32_t>(config.maxThrottleSkipTicks, 1), kMaxSkipFactor);
+
+  // The whole point of the table: this is kMaxSkipFactor divisions once per
+  // tick instead of one per relay edge.
+  policy.tickPhase[0] = 0;
+  for (uint32_t f = 1; f <= kMaxSkipFactor; ++f) {
+    policy.tickPhase[f] = static_cast<uint32_t>(tickIndex % f);
+  }
+  return policy;
+}
+
+uint32_t InterestPolicy::SkipFactor(float sqrDistance,
+                                    uint32_t pressureLevel) const noexcept
+{
+  // Always-on, load-independent rate reduction by distance.
+  //
+  // Relay volume is the quadratic term, and emitting the sends is serial no
+  // matter how the decisions were parallelised, so sending fewer of them is
+  // the only thing that attacks the real cost. Nearby recipients are never
+  // affected.
+  uint32_t interest = 1;
+  if (interestManagement && sqrDistance > sqrFull) {
+    // One step per doubling of the full-rate radius. Squared comparisons keep
+    // this free of square roots on the hottest path in the server.
+    interest = 2;
+    if (sqrDistance > sqrFull4) {
+      interest = 3;
+    }
+    if (sqrDistance > sqrFull16) {
+      interest = 4;
+    }
+    interest = std::min(interest, maxInterestSkip);
+  }
+
+  if (!adaptiveThrottling || pressureLevel == 0) {
+    return interest;
+  }
+
+  // Inside the near band nothing is ever held back by pressure: those are the
+  // players actually fighting or talking to each other, and they are what
+  // "smooth" means to a user.
+  if (sqrDistance <= sqrThrottle) {
+    return interest;
+  }
+
+  // One extra step per doubling of the threshold distance.
+  uint32_t distanceBand = 1;
+  if (sqrDistance > sqrThrottle4) {
+    distanceBand = 2;
+  }
+  if (sqrDistance > sqrThrottle16) {
+    distanceBand = 3;
+  }
+
+  const uint64_t factor =
+    static_cast<uint64_t>(pressureLevel) * distanceBand + 1;
+  const auto pressureSkip =
+    static_cast<uint32_t>(std::min<uint64_t>(factor, maxThrottleSkip));
+
+  // The two mechanisms stack by taking the stronger one rather than
+  // multiplying, so an overloaded server never starves a distant player
+  // beyond whichever cap is the more conservative.
+  return std::max(interest, pressureSkip);
+}
+
+bool InterestPolicy::Transmits(uint32_t skipFactor, uint32_t senderFormId,
+                               Networking::UserId recipientUserId) const noexcept
+{
+  if (skipFactor <= 1) {
+    return true;
+  }
+  const uint32_t phase =
+    ReduceToRange(MixPair(senderFormId, recipientUserId), skipFactor);
+  return tickPhase[skipFactor] == phase;
 }
 
 bool ValidateMovement(const ActorSnapshot& actor) noexcept
@@ -49,80 +162,12 @@ bool ValidateMovement(const ActorSnapshot& actor) noexcept
     kSqrMaxMovementDistance;
 }
 
-namespace {
-
-// Always-on, load-independent rate reduction by distance.
-//
-// Relay volume is the quadratic term, and emitting the sends is serial no
-// matter how the decisions were parallelised, so sending fewer of them is the
-// only thing that attacks the real cost. Nearby recipients are never affected.
-[[nodiscard]] uint32_t InterestSkipFactor(
-  float sqrDistance, const ParallelConfig& config) noexcept
-{
-  if (!config.interestManagement) {
-    return 1;
-  }
-
-  const float full = config.interestFullRateUnits;
-  const float sqrFull = full * full;
-  if (sqrDistance <= sqrFull) {
-    return 1;
-  }
-
-  // One step per doubling of the full-rate radius. Squared comparisons keep
-  // this free of square roots on the hottest path in the server.
-  uint32_t factor = 2;
-  if (sqrDistance > sqrFull * 4.f) {
-    factor = 3;
-  }
-  if (sqrDistance > sqrFull * 16.f) {
-    factor = 4;
-  }
-
-  return std::min(factor, std::max<uint32_t>(config.maxInterestSkipTicks, 1));
-}
-
-}
-
 uint32_t ComputeSkipFactor(float sqrDistance, uint32_t pressureLevel,
                            const ParallelConfig& config) noexcept
 {
-  // Baseline interest management applies whether or not the server is busy.
-  const uint32_t interest = InterestSkipFactor(sqrDistance, config);
-
-  if (!config.adaptiveThrottling || pressureLevel == 0) {
-    return interest;
-  }
-
-  const float threshold = config.throttleDistanceUnits;
-  const float sqrThreshold = threshold * threshold;
-
-  // Inside the near band nothing is ever held back by pressure: those are the
-  // players actually fighting or talking to each other, and they are what
-  // "smooth" means to a user.
-  if (sqrDistance <= sqrThreshold) {
-    return interest;
-  }
-
-  // One extra step per doubling of the threshold distance. Comparing squared
-  // distances against 4x keeps this branch free of square roots.
-  uint32_t distanceBand = 1;
-  if (sqrDistance > sqrThreshold * 4.f) {
-    distanceBand = 2;
-  }
-  if (sqrDistance > sqrThreshold * 16.f) {
-    distanceBand = 3;
-  }
-
-  const uint64_t factor =
-    static_cast<uint64_t>(pressureLevel) * distanceBand + 1;
-  const auto pressureSkip = static_cast<uint32_t>(std::min<uint64_t>(
-    factor, std::max<uint32_t>(config.maxThrottleSkipTicks, 1)));
-
-  // The two mechanisms stack by taking the stronger one rather than
-  // multiplying, so an overloaded server never starves a distant player
-  // beyond whichever cap is the more conservative.
-  return std::max(interest, pressureSkip);
+  // tickIndex is irrelevant to the factor itself, only to the phase.
+  return InterestPolicy::Build(config, 0).SkipFactor(sqrDistance,
+                                                     pressureLevel);
 }
 
 bool ShouldRelayThisTick(uint64_t tickIndex, uint32_t senderFormId,
@@ -132,19 +177,32 @@ bool ShouldRelayThisTick(uint64_t tickIndex, uint32_t senderFormId,
   if (skipFactor <= 1) {
     return true;
   }
-  const uint64_t phase = MixPair(senderFormId, recipientUserId) % skipFactor;
-  return (tickIndex % skipFactor) == phase;
+  if (skipFactor > kMaxSkipFactor) {
+    skipFactor = kMaxSkipFactor;
+  }
+  const uint32_t phase =
+    ReduceToRange(MixPair(senderFormId, recipientUserId), skipFactor);
+  return static_cast<uint32_t>(tickIndex % skipFactor) == phase;
 }
 
 void ProcessRange(const TickSnapshot& snapshot, const uint32_t* actorIndices,
                   size_t actorCount, uint32_t pressureLevel,
-                  const ParallelConfig& config, ClusterOutput& output)
+                  const InterestPolicy& policy, ClusterOutput& output)
 {
   output.Reset();
   if (actorIndices == nullptr || actorCount == 0) {
     return;
   }
   output.verdicts.reserve(actorCount);
+
+  const RelayChunk* const chunksBegin = snapshot.relayChunks.data();
+  const RelayChunk* const chunksEnd = chunksBegin + snapshot.relayChunks.size();
+  const RelayTarget* const targets = snapshot.relayTargets.data();
+
+  const auto chunkLess = [](const RelayChunk& chunk,
+                            const AreaKey& key) noexcept {
+    return chunk.key < key;
+  };
 
   for (size_t i = 0; i < actorCount; ++i) {
     const uint32_t actorIndex = actorIndices[i];
@@ -171,48 +229,56 @@ void ProcessRange(const TickSnapshot& snapshot, const uint32_t* actorIndices,
       continue;
     }
 
-    for (int32_t dy = -1; dy <= 1; ++dy) {
-      for (int32_t dx = -1; dx <= 1; ++dx) {
-        RelayTarget dummyTarget;
-        dummyTarget.worldOrCell = actor.worldOrCell;
-        dummyTarget.chunkX = static_cast<int16_t>(actor.area.chunkX) + dx;
-        dummyTarget.chunkY = static_cast<int16_t>(actor.area.chunkY) + dy;
+    const int32_t centreX = actor.area.chunkX;
+    const int32_t centreY = actor.area.chunkY;
 
-        auto comp = [](const RelayTarget& a, const RelayTarget& b) {
-          if (a.worldOrCell != b.worldOrCell) return a.worldOrCell < b.worldOrCell;
-          if (a.chunkX != b.chunkX) return a.chunkX < b.chunkX;
-          return a.chunkY < b.chunkY;
-        };
+    // The recipients are whoever occupies the 3x3 stencil around the sender,
+    // which is Grid.h's visibility neighbourhood. One binary search per
+    // column rather than one per cell: relayChunks is ordered by
+    // (world, x, y), so a column's three rows are adjacent in it.
+    for (int32_t dx = -1; dx <= 1; ++dx) {
+      const int32_t nx = centreX + dx;
+      if (nx < kInt16Min || nx > kInt16Max) {
+        continue;
+      }
 
-        auto range = std::equal_range(snapshot.relayTargets.begin(),
-                                      snapshot.relayTargets.end(),
-                                      dummyTarget, comp);
+      const int32_t loY = std::max(centreY - 1, kInt16Min);
+      const int32_t hiY = std::min(centreY + 1, kInt16Max);
 
-        for (auto it = range.first; it != range.second; ++it) {
-          const RelayTarget& target = *it;
+      const AreaKey lo{ actor.worldOrCell, static_cast<int16_t>(nx),
+                        static_cast<int16_t>(loY) };
+      const AreaKey hi{ actor.worldOrCell, static_cast<int16_t>(nx),
+                        static_cast<int16_t>(hiY) };
+
+      for (const RelayChunk* chunk =
+             std::lower_bound(chunksBegin, chunksEnd, lo, chunkLess);
+           chunk != chunksEnd && !(hi < chunk->key); ++chunk) {
+
+        for (uint32_t t = chunk->begin; t < chunk->end; ++t) {
+          const RelayTarget& target = targets[t];
           if (target.userId == Networking::InvalidUserId) {
             continue;
           }
 
-      const float sqrDistance = SqrDistance(actor.currentPos, target.pos);
-      const uint32_t skipFactor =
-        ComputeSkipFactor(sqrDistance, pressureLevel, config);
+          const float sqrDistance = SqrDistance(actor.currentPos, target.pos);
+          const uint32_t skipFactor =
+            policy.SkipFactor(sqrDistance, pressureLevel);
 
-      if (!ShouldRelayThisTick(snapshot.tickIndex, actor.formId, target.userId,
-                               skipFactor)) {
-        ++output.throttledEdges;
-        continue;
-      }
+          if (!policy.Transmits(skipFactor, actor.formId, target.userId)) {
+            ++output.throttledEdges;
+            continue;
+          }
 
-      OutboundSend send;
-      send.userId = target.userId;
-      send.byteOffset = actor.packetOffset;
-      send.byteLength = actor.packetLength;
-      // Movement relays are unreliable on the inline path too: the next
-      // update supersedes this one, so a retransmit would only add latency.
-      send.reliable = false;
-      output.sends.push_back(send);
-      ++output.emittedEdges;
+          OutboundSend send;
+          send.userId = target.userId;
+          send.byteOffset = actor.packetOffset;
+          send.byteLength = actor.packetLength;
+          // Movement relays are unreliable on the inline path too: the next
+          // update supersedes this one, so a retransmit would only add
+          // latency.
+          send.reliable = false;
+          output.sends.push_back(send);
+          ++output.emittedEdges;
         }
       }
     }

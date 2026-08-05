@@ -176,6 +176,95 @@ TEST_CASE("Empty batch is a no-op", "[ParallelPool]")
   REQUIRE(pool.GetFailedTaskCount() == 0);
 }
 
+TEST_CASE("Priming does not change results", "[ParallelPool]")
+{
+  // Prime is a scheduling hint and nothing else. Every combination of primed
+  // and not, correct hint and wrong hint, must produce the same work.
+  ThreadPool pool(4);
+
+  for (size_t hint : { size_t(0), size_t(1), size_t(2), size_t(8),
+                       size_t(1000) }) {
+    for (int round = 0; round < 30; ++round) {
+      std::atomic<int> ran{ 0 };
+      std::vector<ThreadPool::Task> tasks;
+      for (int i = 0; i < 7; ++i) {
+        tasks.emplace_back([&ran](size_t) { ran.fetch_add(1); });
+      }
+      pool.Prime(hint);
+      pool.Run(tasks);
+      REQUIRE(ran.load() == 7);
+    }
+  }
+}
+
+TEST_CASE("Priming without a batch leaves the pool usable", "[ParallelPool]")
+{
+  // A tick can prime and then submit nothing -- every movement packet may be
+  // declined. Workers must spin out their budget and park again rather than
+  // consuming a batch that never came.
+  ThreadPool pool(3);
+
+  for (int round = 0; round < 20; ++round) {
+    pool.Prime(4);
+  }
+
+  std::atomic<int> ran{ 0 };
+  std::vector<ThreadPool::Task> tasks;
+  for (int i = 0; i < 12; ++i) {
+    tasks.emplace_back([&ran](size_t) { ran.fetch_add(1); });
+  }
+  pool.Run(tasks);
+  REQUIRE(ran.load() == 12);
+  REQUIRE(pool.GetFailedTaskCount() == 0);
+}
+
+TEST_CASE("The claim protocol runs every task exactly once", "[ParallelPool]")
+{
+  // The claim protocol is a compare-exchange over a packed
+  // (generation, index) word. A lost exchange must retry, not skip, and a
+  // straggler from the previous batch must not consume an index from this
+  // one. Both would show up here as a task index seen zero or twice.
+  ThreadPool pool(6);
+
+  for (int round = 0; round < 200; ++round) {
+    constexpr int kCount = 37;
+    std::vector<std::atomic<int>> seen(kCount);
+    for (auto& counter : seen) {
+      counter.store(0);
+    }
+
+    std::vector<ThreadPool::Task> tasks;
+    for (int i = 0; i < kCount; ++i) {
+      tasks.emplace_back([&seen, i](size_t) { seen[i].fetch_add(1); });
+    }
+    pool.Prime(kCount);
+    pool.Run(tasks);
+
+    for (int i = 0; i < kCount; ++i) {
+      REQUIRE(seen[i].load() == 1);
+    }
+  }
+}
+
+TEST_CASE("A pool that never spins still completes", "[ParallelPool]")
+{
+  // workerSpinMicros of 0 is the documented escape hatch, and it takes the
+  // pool down a different path: no worker is ever awake when Run publishes,
+  // so every batch goes through the condition variable.
+  ThreadPool pool(4, 0);
+
+  for (int round = 0; round < 60; ++round) {
+    std::atomic<int> ran{ 0 };
+    std::vector<ThreadPool::Task> tasks;
+    for (int i = 0; i < 9; ++i) {
+      tasks.emplace_back([&ran](size_t) { ran.fetch_add(1); });
+    }
+    pool.Prime(9);
+    pool.Run(tasks);
+    REQUIRE(ran.load() == 9);
+  }
+}
+
 TEST_CASE("Uneven task costs still drain", "[ParallelPool]")
 {
   // Dynamic scheduling exists so that one long task cannot leave the other

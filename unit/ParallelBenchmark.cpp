@@ -116,7 +116,8 @@ MpParallel::ParallelConfig MakeConfig(size_t workers)
 }
 
 Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
-                   bool useJson = false, bool interestMgmt = false)
+                   bool useJson = false, bool interestMgmt = false,
+                   uint32_t minShardMicros = 0)
 {
   PartOne partOne;
   NullSendTarget sendTarget;
@@ -125,6 +126,9 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
   if (parallel) {
     MpParallel::ParallelConfig config = MakeConfig(workers);
     config.interestManagement = interestMgmt;
+    if (minShardMicros > 0) {
+      config.minShardMicros = minShardMicros;
+    }
     config.Normalize();
     partOne.ConfigureParallelism(config);
   }
@@ -173,9 +177,25 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
   }
 
   sendTarget.sendCount = 0;
+
+  // The phase counters are per-tick and get overwritten, so they are summed
+  // as we go. Reading a handful of uint64s per tick is nothing against a tick
+  // measured in hundreds of microseconds, and the alternative -- reporting
+  // the last tick's breakdown against an averaged tick time -- produced
+  // impossible numbers whenever the final tick happened to be an outlier.
+  uint64_t parallelSum = 0;
+  uint64_t joinSum = 0;
+  uint64_t taskSum = 0;
+
   const auto start = std::chrono::steady_clock::now();
   for (int t = 0; t < ticks; ++t) {
     oneTick();
+    if (parallel) {
+      const MpParallel::ParallelMetrics& m = partOne.GetParallelMetrics();
+      parallelSum += m.lastParallelMicros;
+      joinSum += m.lastJoinMicros;
+      taskSum += m.lastAggregateTaskMicros;
+    }
   }
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
@@ -190,9 +210,11 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
     sample.units = m.lastWorkUnitCount;
     sample.biggest = m.lastLargestClusterSize;
     sample.reportedSpeedup = m.GetLastSpeedup();
-    sample.parallelMicros = m.lastParallelMicros;
-    sample.joinMicros = m.lastJoinMicros;
-    sample.aggregateTaskMicros = m.lastAggregateTaskMicros;
+
+    const auto n = static_cast<uint64_t>(ticks);
+    sample.parallelMicros = parallelSum / n;
+    sample.joinMicros = joinSum / n;
+    sample.aggregateTaskMicros = taskSum / n;
   }
   return sample;
 }
@@ -204,7 +226,9 @@ TEST_CASE("Parallel offload throughput vs inline", "[.][ParallelBench]")
   // Extended past 150 to find the crossover: the offload only earns its
   // barrier overhead once the parallel phase is large enough to amortize it.
   const std::vector<int> populations = { 25, 50, 100, 150, 250, 400 };
-  constexpr int kTicks = 40;
+  // At 40 ticks the run-to-run spread on this machine was about 12%, wider
+  // than several of the effects being reported. 150 brings it under 3%.
+  constexpr int kTicks = 150;
 
   const size_t hw = std::thread::hardware_concurrency();
   std::printf("\n  hardware_concurrency = %zu\n", hw);
@@ -244,10 +268,16 @@ TEST_CASE("Parallel offload throughput vs inline", "[.][ParallelBench]")
                 static_cast<unsigned long long>(
                   parallelRun.aggregateTaskMicros));
 
-    // The crowd must have formed one cluster and been sharded, otherwise the
-    // benchmark is not measuring what it claims to.
+    // The crowd must have formed one cluster, otherwise the benchmark is not
+    // measuring what it claims to.
+    //
+    // Unit count is deliberately not asserted to be > 1. Shards are sized by
+    // estimated work, so a small population collapsing to a single unit -- and
+    // skipping the barrier entirely -- is the intended outcome, not a sign the
+    // benchmark stopped exercising sharding. The larger populations below do
+    // still shard, and the printed column shows it.
     REQUIRE(parallelRun.clusters == 1);
-    REQUIRE(parallelRun.units > 1);
+    REQUIRE(parallelRun.units >= 1);
   }
   std::printf("\n");
 }
@@ -258,7 +288,7 @@ TEST_CASE("Interest management: what cutting relays actually buys",
   // At 400 players the join emits 160k relays serially and dominates the
   // tick. Parallelising decisions cannot help that; sending less can. This
   // measures the only lever that attacks the N^2 term directly.
-  constexpr int kTicks = 30;
+  constexpr int kTicks = 150;
   std::printf("\n  relay volume vs tick cost, 400 players in one chunk\n\n");
   std::printf("  %-26s %10s %12s\n", "configuration", "relays", "us/tick");
   std::printf("  %s\n", std::string(52, '-').c_str());
@@ -314,26 +344,66 @@ TEST_CASE("Wire format ingest cost: binary vs legacy JSON",
   std::printf("\n");
 }
 
+TEST_CASE("Shard granularity: how small a work unit still pays",
+          "[.][ParallelBench]")
+{
+  // Shards are sized by estimated work rather than by actor count, and
+  // minShardMicros is the knob that says how small a piece is still worth
+  // handing to the scheduler. Too large and the tick never splits at all; too
+  // small and the batch is more dispatch than work. This is where the default
+  // comes from -- re-run it on the target hardware before changing it.
+  //
+  // More ticks than the other cases: the differences being resolved here are
+  // tens of microseconds on a few hundred, and at 40 ticks the run-to-run
+  // spread was wider than the effect.
+  constexpr int kTicks = 150;
+  std::printf("\n  us/tick by minShardMicros (0 = inline baseline)\n\n");
+  std::printf("  %-8s %10s", "players", "inline");
+  for (uint32_t m : { 8u, 12u, 20u, 30u, 60u }) {
+    std::printf(" %7uus", m);
+  }
+  std::printf("\n  %s\n", std::string(64, '-').c_str());
+
+  for (int players : { 50, 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("  %-8d %9.1f", players, baseline.perTickMicros);
+    for (uint32_t m : { 8u, 12u, 20u, 30u, 60u }) {
+      const Sample run =
+        RunScenario(players, true, 0, kTicks, false, false, m);
+      REQUIRE(run.relays == baseline.relays);
+      std::printf("  %5.1f/%-3zu", run.perTickMicros, run.units);
+    }
+    std::printf("\n");
+  }
+  std::printf("\n  (cell is us/tick and work-unit count)\n\n");
+}
+
 TEST_CASE("Parallel offload scaling by worker count", "[.][ParallelBench]")
 {
-  constexpr int kPlayers = 150;
-  constexpr int kTicks = 40;
+  // This is where the auto-detect default comes from. More workers is not
+  // monotonically better: past the point where the shard budget can keep them
+  // fed, extra threads only add scheduling pressure and cross-core traffic on
+  // the output buffers the join has to read back.
+  constexpr int kTicks = 150;
 
-  const Sample baseline = RunScenario(kPlayers, false, 0, kTicks);
-  std::printf("\n  %d players, %d ticks, inline baseline = %.1f us/tick\n\n",
-              kPlayers, kTicks, baseline.perTickMicros);
-  std::printf("  %-8s %12s %9s\n", "workers", "us/tick", "speedup");
-  std::printf("  %s\n", std::string(34, '-').c_str());
+  for (int players : { 150, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("\n  %d players, %d ticks, inline baseline = %.1f us/tick\n\n",
+                players, kTicks, baseline.perTickMicros);
+    std::printf("  %-8s %12s %9s %8s\n", "workers", "us/tick", "speedup",
+                "units");
+    std::printf("  %s\n", std::string(42, '-').c_str());
 
-  for (size_t workers : { size_t(1), size_t(2), size_t(4), size_t(8),
-                          size_t(16) }) {
-    if (workers > std::thread::hardware_concurrency()) {
-      continue;
+    for (size_t workers : { size_t(1), size_t(2), size_t(4), size_t(6),
+                            size_t(8), size_t(12), size_t(16), size_t(24) }) {
+      if (workers > std::thread::hardware_concurrency()) {
+        continue;
+      }
+      const Sample run = RunScenario(players, true, workers, kTicks);
+      REQUIRE(run.relays == baseline.relays);
+      std::printf("  %-8zu %12.1f %8.2fx %8zu\n", workers, run.perTickMicros,
+                  baseline.perTickMicros / run.perTickMicros, run.units);
     }
-    const Sample run = RunScenario(kPlayers, true, workers, kTicks);
-    REQUIRE(run.relays == baseline.relays);
-    std::printf("  %-8zu %12.1f %8.2fx\n", workers, run.perTickMicros,
-                baseline.perTickMicros / run.perTickMicros);
   }
   std::printf("\n");
 }

@@ -11,10 +11,61 @@ namespace MpParallel {
 // the offloaded path would accept updates the inline path rejects.
 constexpr float kSqrMaxMovementDistance = 4096.f * 4096.f;
 
+// Largest skip factor either mechanism may produce. Normalize clamps both
+// maxInterestSkipTicks and maxThrottleSkipTicks to this, which is what lets
+// InterestPolicy precompute a phase table instead of dividing per edge.
+constexpr uint32_t kMaxSkipFactor = 32;
+
 // The pure half of the framework: given a snapshot, decide what should
 // happen. Nothing here touches the world, the network, or any shared mutable
 // state, which is exactly why it can run on a worker thread.
 namespace InterestManager {
+
+// Everything the per-edge decision needs, with the per-tick and per-config
+// invariants already folded in.
+//
+// This exists because the decision runs once per (sender, recipient) pair and
+// that is the N^2 term: at 400 players in one area it is 160,000 evaluations
+// a tick. Squaring the configured radii and reducing the tick index modulo
+// every possible skip factor are loop invariants, and the modulo in
+// particular is an integer division -- tens of cycles -- that used to be paid
+// twice per throttled edge.
+struct InterestPolicy
+{
+  bool interestManagement = false;
+  bool adaptiveThrottling = false;
+
+  // Squared interest radius and its two doubling steps.
+  float sqrFull = 0.f;
+  float sqrFull4 = 0.f;
+  float sqrFull16 = 0.f;
+
+  // Squared pressure-throttle radius and its two doubling steps.
+  float sqrThrottle = 0.f;
+  float sqrThrottle4 = 0.f;
+  float sqrThrottle16 = 0.f;
+
+  uint32_t maxInterestSkip = 1;
+  uint32_t maxThrottleSkip = 1;
+
+  // tickPhase[f] is tickIndex % f, for every f a skip factor can take.
+  // Index 0 is unused and index 1 is always 0.
+  uint32_t tickPhase[kMaxSkipFactor + 1] = {};
+
+  [[nodiscard]] static InterestPolicy Build(const ParallelConfig& config,
+                                            uint64_t tickIndex) noexcept;
+
+  // How many ticks apart relays to a recipient at this distance should be
+  // spaced. 1 means "every tick".
+  [[nodiscard]] uint32_t SkipFactor(float sqrDistance,
+                                    uint32_t pressureLevel) const noexcept;
+
+  // Whether this particular (sender, recipient) edge transmits on this tick.
+  // `skipFactor` must be in [1, kMaxSkipFactor].
+  [[nodiscard]] bool Transmits(uint32_t skipFactor, uint32_t senderFormId,
+                               Networking::UserId recipientUserId) const
+    noexcept;
+};
 
 // Reproduces MovementValidation::Validate against snapshot data.
 //
@@ -28,6 +79,10 @@ namespace InterestManager {
 // 1 means "every tick". The value grows with distance and with how far the
 // cluster is over its time budget, so a quiet server never throttles and a
 // packed city square degrades smoothly instead of stalling the tick.
+//
+// Equivalent to InterestPolicy::SkipFactor; kept as a standalone entry point
+// because it is the readable statement of the policy and what the tests
+// pin down.
 [[nodiscard]] uint32_t ComputeSkipFactor(float sqrDistance,
                                          uint32_t pressureLevel,
                                          const ParallelConfig& config) noexcept;
@@ -57,7 +112,7 @@ namespace InterestManager {
 // plain input here and introduces no cross-task dependency.
 void ProcessRange(const TickSnapshot& snapshot, const uint32_t* actorIndices,
                   size_t actorCount, uint32_t pressureLevel,
-                  const ParallelConfig& config, ClusterOutput& output);
+                  const InterestPolicy& policy, ClusterOutput& output);
 
 }
 

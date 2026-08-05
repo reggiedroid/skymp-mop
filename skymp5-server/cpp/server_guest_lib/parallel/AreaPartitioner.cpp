@@ -59,22 +59,51 @@ void AreaPartitioner::Partition(std::vector<ActorSnapshot>& actors,
   const int32_t separation =
     std::max(separationChunks, kMinSafeSeparationChunks);
 
-  // Pass 1: collect the distinct occupied chunks, then sort them. Sorting
-  // before anything else is assigned an index is what makes the result
-  // independent of the order packets happened to arrive in.
-  chunkKeys.reserve(actors.size());
-  for (const ActorSnapshot& actor : actors) {
-    chunkKeys.push_back(actor.area);
+  // Pass 1: collect the distinct occupied chunks.
+  //
+  // Deduplicating through the hash map rather than by sorting the whole actor
+  // list keeps this O(actors) instead of O(actors log actors). The difference
+  // is the normal case, not the exotic one: a crowd is many actors in few
+  // chunks, so sorting one key per actor was sorting the same value over and
+  // over.
+  actorChunkSlot.resize(actors.size());
+  for (uint32_t i = 0; i < static_cast<uint32_t>(actors.size()); ++i) {
+    const auto inserted = chunkIndexByKey.emplace(
+      actors[i].area, static_cast<uint32_t>(chunkKeys.size()));
+    if (inserted.second) {
+      chunkKeys.push_back(actors[i].area);
+    }
+    actorChunkSlot[i] = inserted.first->second;
   }
-  std::sort(chunkKeys.begin(), chunkKeys.end());
-  chunkKeys.erase(std::unique(chunkKeys.begin(), chunkKeys.end()),
-                  chunkKeys.end());
 
   const uint32_t chunkCount = static_cast<uint32_t>(chunkKeys.size());
 
-  chunkIndexByKey.reserve(chunkCount * 2);
+  // chunkKeys is in first-seen order, which depends on the order packets
+  // happened to arrive in. Renumbering the chunks into sorted order here is
+  // what makes everything downstream -- cluster indices, member lists, the
+  // join sequence -- reproducible.
+  chunkOrder.resize(chunkCount);
   for (uint32_t i = 0; i < chunkCount; ++i) {
-    chunkIndexByKey.emplace(chunkKeys[i], i);
+    chunkOrder[i] = i;
+  }
+  std::sort(chunkOrder.begin(), chunkOrder.end(),
+            [this](uint32_t lhs, uint32_t rhs) {
+              return chunkKeys[lhs] < chunkKeys[rhs];
+            });
+
+  chunkRemap.resize(chunkCount);
+  sortedChunkKeys.resize(chunkCount);
+  for (uint32_t rank = 0; rank < chunkCount; ++rank) {
+    chunkRemap[chunkOrder[rank]] = rank;
+    sortedChunkKeys[rank] = chunkKeys[chunkOrder[rank]];
+  }
+  chunkKeys.swap(sortedChunkKeys);
+
+  for (auto& entry : chunkIndexByKey) {
+    entry.second = chunkRemap[entry.second];
+  }
+  for (uint32_t& slot : actorChunkSlot) {
+    slot = chunkRemap[slot];
   }
 
   // Pass 2: union chunks that are within `separation` of each other. Probing
@@ -143,19 +172,9 @@ void AreaPartitioner::Partition(std::vector<ActorSnapshot>& actors,
   // actorIndices list ascending without a second sort.
   for (uint32_t actorIndex = 0;
        actorIndex < static_cast<uint32_t>(actors.size()); ++actorIndex) {
-    ActorSnapshot& actor = actors[actorIndex];
-    auto it = chunkIndexByKey.find(actor.area);
-    if (it == chunkIndexByKey.end()) {
-      // Unreachable: every actor's chunk was inserted in pass 1.
-      actor.clusterIndex = kUnassignedCluster;
-      continue;
-    }
-
-    const uint32_t clusterIndex = clusterOfChunk[it->second];
-    actor.clusterIndex = clusterIndex;
-
-    AreaCluster& cluster = outClusters[clusterIndex];
-    cluster.actorIndices.push_back(actorIndex);
+    const uint32_t clusterIndex = clusterOfChunk[actorChunkSlot[actorIndex]];
+    actors[actorIndex].clusterIndex = clusterIndex;
+    outClusters[clusterIndex].actorIndices.push_back(actorIndex);
   }
 }
 

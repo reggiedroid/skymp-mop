@@ -1,6 +1,8 @@
 #pragma once
 // For kMinSafeSeparationChunks, which Normalize clamps against.
 #include "AreaKey.h"
+// For kDefaultSpinMicros, the default of workerSpinMicros.
+#include "ThreadPool.h"
 #include <cstddef>
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
@@ -19,25 +21,40 @@ struct ParallelConfig
 {
   bool enabled = false;
 
-  // 0 means "auto": hardware_concurrency() minus two reserved cores (one for
-  // the Node/V8 main thread, one for the async save-storage thread), clamped
-  // to [1, kMaxWorkerThreads].
+  // 0 means "auto": an estimate of physical cores minus one for the Node/V8
+  // main thread, capped at 8. See kMaxAutoWorkerThreads in ParallelConfig.cpp
+  // for why the cap is there and what it was measured against -- past it,
+  // more threads made the tick markedly slower rather than faster. An
+  // explicit value here is bounded only by kMaxWorkerThreads.
   size_t workerThreads = 0;
 
   // Below this many tracked actors the fork/join barrier costs more than the
-  // work it distributes, so the dispatcher runs everything inline.
+  // work it distributes, so the dispatcher runs everything on the calling
+  // thread.
   //
   // Measured, not guessed. unit/ParallelBenchmark.cpp times the inline path
   // against the offloaded one with every player in a single chunk:
   //
   //     players    25     50    100    150    250    400
-  //     speedup  0.25x  0.43x  0.66x  0.81x  0.88x  1.10x
+  //     was      0.25x  0.43x  0.66x  0.81x  0.88x  1.10x
+  //     now      0.85x  0.88x  0.99x  1.29x  1.87x  2.17x
   //
-  // Break-even sits near 300-400. Anything lower makes the offload a
-  // regression, because the barrier and snapshot costs are paid every tick
-  // while the parallel phase is still small. Re-run
-  // `./unit/unit "[ParallelBench]"` on the target hardware before lowering it.
-  size_t minActorsToOffload = 300;
+  // Break-even used to sit near 300-400 and now sits near 100. What moved it
+  // was not the parallel phase, which was always small, but the three serial
+  // costs around it: the barrier (a condvar round trip every tick, ~50us of a
+  // 64us parallel phase at 150 players), the join (three virtual calls and a
+  // throw-if-null send-target lookup per relay edge), and shards sized by
+  // actor count rather than by work.
+  //
+  // Note this threshold only turns the *thread pool* off. Flattening packets
+  // into the snapshot still happens, so below it the feature is a few percent
+  // of tick time in exchange for interest management's bandwidth reduction.
+  // A server that never approaches 100 concurrent movers and does not need
+  // that reduction should leave `enabled` false.
+  //
+  // Re-run `./unit/unit "[ParallelBench]"` on the target hardware before
+  // changing it.
+  size_t minActorsToOffload = 100;
 
   // Clusters smaller than this are merged into the inline residual batch
   // rather than being scheduled as their own task.
@@ -56,6 +73,29 @@ struct ParallelConfig
   // 0 means "auto": twice the slot count, which gives the dynamic scheduler
   // enough pieces to balance without paying for needless task overhead.
   size_t maxShardsPerCluster = 0;
+
+  // Smallest amount of estimated work, in microseconds, that justifies making
+  // a separate shard out of it.
+  //
+  // Shards used to be sized purely by actor count, which produced 50 work
+  // units for 150 actors -- three actors and a couple of microseconds each,
+  // well under what a scheduler round trip costs. The measured symptom was
+  // that raising the worker count from 8 to 16 made the tick *slower*. Sizing
+  // by estimated work instead means a quiet tick collapses to one unit and
+  // skips the barrier entirely, and a busy one still splits far enough to
+  // fill every core.
+  //
+  // 20 is measured, by the `Shard granularity` case in ParallelBenchmark.cpp:
+  //
+  //     players    inline   8us    12us   20us   30us   60us
+  //     100         100     147    131    131    142    142
+  //     150         198     317    253    230    232    278
+  //
+  // It is the optimum for the 100-250 band. Larger populations do slightly
+  // better on larger shards -- at 400 the best value was nearer 60 -- but by
+  // then the serial join dominates the tick and the shard size stops
+  // mattering much either way.
+  uint32_t minShardMicros = 20;
 
   // --- interest management -----------------------------------------------
   //
@@ -87,12 +127,6 @@ struct ParallelConfig
   // the calling thread instead of going through the scheduler.
   size_t maxWorkUnitsPerTick = 0;
 
-  // How often the partition is rebuilt. Between rebuilds the previous
-  // partition is reused, which is safe because actors are re-bucketed by
-  // their live chunk every tick and a stale cluster only costs balance
-  // quality, never correctness.
-  uint32_t repartitionIntervalTicks = 30;
-
   // Degrade relay frequency for distant neighbours when a cluster exceeds its
   // share of the tick budget, instead of letting the whole server stall.
   bool adaptiveThrottling = true;
@@ -109,6 +143,11 @@ struct ParallelConfig
 
   // Emit a per-tick summary line at this interval. 0 disables reporting.
   uint32_t metricsLogIntervalTicks = 0;
+
+  // How long a worker stays hot after being told a batch is coming, before it
+  // parks again. Sized to cover packet ingest, which is the gap it exists to
+  // bridge; see ThreadPool.h. 0 disables spinning entirely.
+  uint32_t workerSpinMicros = kDefaultSpinMicros;
 
   // Resolves workerThreads==0 to a concrete count and clamps every field to
   // its documented range. Idempotent.

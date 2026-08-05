@@ -1,6 +1,7 @@
 #pragma once
 #include "AreaCluster.h"
 #include "AreaPartitioner.h"
+#include "InterestManager.h"
 #include "LoadBalancer.h"
 #include "ParallelConfig.h"
 #include "ParallelMetrics.h"
@@ -63,8 +64,21 @@ public:
   // update.
   virtual void SendCorrection(const ActorSnapshot& actor) = 0;
 
-  virtual void SendRelay(Networking::UserId userId, const uint8_t* data,
-                         size_t length, bool reliable) = 0;
+  // Hands over one work unit's relay list in one call.
+  //
+  // Per-edge rather than per-batch was the obvious shape and the wrong one:
+  // relaying is the N^2 term, so at 400 players in one area this was 160,000
+  // virtual calls a tick, each of which then re-resolved the send target --
+  // a pointer chase and a throw-if-null -- and re-checked the recipient's
+  // connection. All three are loop invariants, and a batched call is what
+  // lets the implementation hoist them.
+  //
+  // `sends` index into [packetBytes, packetBytes + packetBytesLength). The
+  // implementation must bounds-check them; a range that does not fit is a
+  // malformed submission and should be skipped, not clamped.
+  virtual void SendRelayBatch(const OutboundSend* sends, size_t count,
+                              const uint8_t* packetBytes,
+                              size_t packetBytesLength) = 0;
 };
 
 // Collects movement updates during packet ingest, processes them across the
@@ -104,6 +118,13 @@ public:
   // This $O(N)$ snapshot is passed to workers so they can spatially filter
   // recipients without enumerating the $O(N^2)$ edges on the main thread.
   void SetPotentialTargets(std::vector<RelayTarget>&& targets);
+
+  // Allocation-free form of the above: the caller fills the returned (empty)
+  // buffer in place and then calls CommitPotentialTargets. Rebuilding the
+  // list is a per-tick job, so handing over a fresh vector every time meant a
+  // heap round trip per tick for no reason.
+  [[nodiscard]] std::vector<RelayTarget>& BeginPotentialTargets() noexcept;
+  void CommitPotentialTargets();
 
   [[nodiscard]] size_t GetPendingCount() const noexcept
   {
@@ -155,7 +176,18 @@ private:
   void RunUnits();
   void JoinResults(IOffloadSink& sink);
   void ResetPool();
-  [[nodiscard]] size_t ComputeShardCount(size_t clusterSize) const;
+  [[nodiscard]] size_t ComputeShardCount(size_t clusterSize,
+                                         size_t shardBudget) const;
+
+  // How many shards this tick's work is worth splitting into in total.
+  //
+  // Sizing shards by actor count alone produced 50 work units for 150 actors,
+  // three actors each: far below what a scheduler round trip costs, and the
+  // measured result was that more worker threads made the tick slower rather
+  // than faster. This sizes them by estimated *work* instead, from the
+  // per-actor cost the previous ticks actually took, so a quiet tick collapses
+  // to a single unit and skips the barrier entirely.
+  [[nodiscard]] size_t ComputeShardBudget() const;
 
   ParallelConfig config;
   std::unique_ptr<ThreadPool> pool;
@@ -188,8 +220,32 @@ private:
   // by their cluster's rank without a lookup per comparison.
   std::vector<uint32_t> clusterRank;
 
+  // Rebuilt once per tick and read by every task. Const for the whole
+  // parallel phase, like the snapshot itself.
+  InterestManager::InterestPolicy policy;
+
+  // Whether the most recent tick actually partitioned by area. On the inline
+  // path the "clusters" are one synthetic bucket holding the whole server, so
+  // its cost says nothing about any real area.
+  bool lastTickOffloaded = false;
+
   ParallelMetrics metrics;
   uint64_t lastFailedTaskCount = 0;
+
+  // Smoothed cost of processing one actor, in microseconds. Feeds the shard
+  // budget. Zero until the first tick has been measured, which is treated as
+  // "no estimate" rather than "free".
+  double microsPerActorEma = 0.0;
+
+  // Whether the pool has already been told this tick's batch is coming. The
+  // hint is worth sending once, on the first submission, which is as early as
+  // the fact is known.
+  bool poolPrimed = false;
+
+  // How many tasks the previous tick pooled, used as the size hint for the
+  // prime. Starts at 0 so the very first tick primes nothing and simply pays
+  // the wakeup.
+  size_t lastPooledUnitEstimate = 0;
 };
 
 }
