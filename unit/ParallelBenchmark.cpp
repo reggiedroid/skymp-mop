@@ -117,7 +117,7 @@ MpParallel::ParallelConfig MakeConfig(size_t workers)
 
 Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
                    bool useJson = false, bool interestMgmt = false,
-                   uint32_t minShardMicros = 0)
+                   uint32_t minShardMicros = 0, size_t maxShards = 0)
 {
   PartOne partOne;
   NullSendTarget sendTarget;
@@ -128,6 +128,9 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
     config.interestManagement = interestMgmt;
     if (minShardMicros > 0) {
       config.minShardMicros = minShardMicros;
+    }
+    if (maxShards > 0) {
+      config.maxShardsPerCluster = maxShards;
     }
     config.Normalize();
     partOne.ConfigureParallelism(config);
@@ -376,6 +379,46 @@ TEST_CASE("Shard granularity: how small a work unit still pays",
     std::printf("\n");
   }
   std::printf("\n  (cell is us/tick and work-unit count)\n\n");
+}
+
+TEST_CASE("Idle threads: does pool size cost anything on its own?",
+          "[.][ParallelBench]")
+{
+  // The question any adaptive width control turns on. If the number of workers
+  // *involved* in a tick is what matters, a controller can vary it per tick for
+  // free by capping the shard count -- surplus workers stay parked in the
+  // condition variable and cost nothing. If merely having the threads exist is
+  // what costs, then adapting width means destroying and respawning OS threads,
+  // which is far too expensive to do per tick.
+  //
+  // The unit count is pinned with maxShardsPerCluster so that only the pool
+  // size varies. Read each row against the 4-worker row: flat means idle
+  // threads are free.
+  constexpr int kTicks = 150;
+
+  for (int players : { 150, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("\n  %d players, unit count pinned, inline baseline %.1f us\n\n",
+                players, baseline.perTickMicros);
+    std::printf("  %-10s %10s %10s %10s\n", "pool size", "4 units", "8 units",
+                "16 units");
+    std::printf("  %s\n", std::string(46, '-').c_str());
+
+    for (size_t workers : { size_t(4), size_t(8), size_t(16), size_t(24) }) {
+      if (workers > std::thread::hardware_concurrency()) {
+        continue;
+      }
+      std::printf("  %-10zu", workers);
+      for (size_t units : { size_t(4), size_t(8), size_t(16) }) {
+        const Sample run =
+          RunScenario(players, true, workers, kTicks, false, false, 1, units);
+        REQUIRE(run.relays == baseline.relays);
+        std::printf(" %9.1f", run.perTickMicros);
+      }
+      std::printf("\n");
+    }
+  }
+  std::printf("\n");
 }
 
 TEST_CASE("Parallel offload scaling by worker count", "[.][ParallelBench]")

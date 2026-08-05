@@ -126,22 +126,51 @@ which is what interest management is for.
 
 ### Worker count is not "as many as the machine has"
 
-Measured at 400 players against a 1196µs inline baseline:
+Measured at 400 players against a 1196µs inline baseline, with the shard budget
+left to auto-size — so the unit count grows with the pool:
 
 | workers | 4 | 6 | 8 | 12 | 16 | 24 |
 | --- | --- | --- | --- | --- | --- | --- |
-| speedup | 2.04× | 2.18× | **2.19×** | 1.56× | 1.58× | 1.56× |
+| speedup | 1.58× | 1.69× | 1.75× | **1.80×** | 1.69× | 1.58× |
 
-The cliff between 8 and 12 is topology, not scheduling: that part is two
-8-core chiplets with separate L3, and a pool that fits inside one of them
-keeps the relay buffers in a cache the join can read back cheaply. It is not
-the unit count — 18 units on 8 workers took 546µs, while 17 units on 30
-workers took 1150µs.
+The important part is *why* it falls off, because the answer decides whether the
+pool can be resized cheaply. Pinning the unit count with `maxShardsPerCluster`
+so that only the pool size varies separates the two:
 
-Auto-detect therefore estimates *physical* cores (`hardware_concurrency` counts
-SMT siblings, which share execution units with the threads that would be
-spinning), leaves one for the Node thread, and caps the result at 8. Set
-`workerThreads` explicitly after running the benchmark on your own hardware.
+400 players, µs/tick, unit count pinned:
+
+| pool size | 4 units | 8 units | 16 units |
+| --- | --- | --- | --- |
+| 4 | 622 | 610 | 615 |
+| 8 | 628 | **544** | 551 |
+| 16 | 628 | 547 | 583 |
+| 24 | 627 | 550 | 572 |
+
+Read down the columns: with the unit count fixed, going from 8 workers to 24
+costs about 1%. Read across: going from 4 units to 8 is worth 12%. **The
+control variable is how many workers a tick actually involves — which is the
+unit count — not how many threads exist.** Surplus threads stay parked in the
+condition variable and are nearly free. At 150 players the residual pool-size
+cost is larger, around 10%, but still nothing like the difference the unit count
+makes.
+
+> **Correction.** An earlier revision of this page attributed the fall-off to
+> cache topology — two 8-core chiplets with separate L3 — citing "18 units on 8
+> workers took 546µs while 17 units on 30 workers took 1150µs". That comparison
+> was confounded: it was measured before the wake-accounting fix in the same
+> change, where `Run` re-woke workers that `Prime` had already woken, so the
+> 30-worker figure was paying a surplus thread wakeup per tick rather than a
+> cross-die transfer. With that fixed and the unit count pinned, the table above
+> shows no such cliff. The chiplet explanation was not supported by the
+> evidence given for it.
+
+Auto-detect still estimates *physical* cores (`hardware_concurrency` counts SMT
+siblings, which share execution units with the threads that would be spinning),
+leaves one for the Node thread, and caps at 8 — but the justification is now the
+modest one it deserves: it bounds the auto-sized unit count, via the `slots × 2`
+ceiling, to a range that measured well across every population tried, and keeps
+the residual pool-size cost small. Set `workerThreads` explicitly after running
+the benchmark on your own hardware.
 
 Clusters still matter. They are what makes each shard's recipient set and
 pressure level well defined, and they let two distant crowds be costed

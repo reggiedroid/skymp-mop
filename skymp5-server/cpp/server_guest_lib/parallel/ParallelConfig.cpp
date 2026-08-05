@@ -13,24 +13,38 @@ namespace {
 // Ceiling on the *auto-detected* worker count. An explicit workerThreads in
 // server-settings.json is only bounded by kMaxWorkerThreads.
 //
-// More threads stops helping well before the machine runs out of them, and
-// then starts hurting sharply. Measured by the `Parallel offload scaling by
-// worker count` case on a 16-core/32-thread Ryzen 9950X3D, 400 players in one
-// area, against a 1196us inline baseline:
+// This bounds two things at once, and the second is the one that matters.
 //
-//     workers    4      6      8      12     16     24
-//     speedup   2.04x  2.18x  2.19x  1.56x  1.58x  1.56x
+// What actually decides the tick cost is how many workers a tick *involves*,
+// which is the work-unit count, not how many threads exist. Measured by the
+// `Idle threads` case on a 16-core/32-thread Ryzen 9950X3D at 400 players in
+// one area, us/tick with the unit count pinned so only pool size varies:
 //
-// The cliff between 8 and 12 is not the unit count -- 18 units on 8 workers
-// took 546us while 17 units on 30 workers took 1150us. It is the topology.
-// That part has two 8-core chiplets with separate L3, so a pool that fits in
-// one of them keeps the relay buffers in a cache the join can read back
-// cheaply, and a pool that spills across both pays a cross-die transfer for
-// every one of them.
+//     pool size    4 units   8 units   16 units
+//     4              622       610       615
+//     8              628       544       551
+//     16             628       547       583
+//     24             627       550       572
 //
-// 8 is therefore not a universal optimum, it is the size of the largest cache
-// domain on common desktop and server parts. Operators on other hardware
-// should run the benchmark and set workerThreads explicitly.
+// Down a column, 8 workers to 24 costs about 1%. Across a row, 4 units to 8 is
+// worth 12%. Surplus threads park in the condition variable and are nearly
+// free; at 150 players the residual is larger, around 10%, but still far below
+// what the unit count is worth.
+//
+// So the cap earns its keep indirectly: the auto shard budget ceiling is
+// `slots * 2`, so capping the pool at 8 caps the auto-sized unit count at 18,
+// which measured at or near the optimum for every population tried. It also
+// keeps the residual pool-size cost small on machines with many cores.
+//
+// An earlier version of this comment claimed the fall-off past 8 was cache
+// topology (two 8-core chiplets with separate L3). That was wrong: the
+// evidence cited for it was measured before the wake-accounting fix in the
+// same change, where Run re-woke workers Prime had already woken, so the
+// large-pool figure was paying surplus thread wakeups rather than cross-die
+// transfers. With the unit count pinned there is no such cliff.
+//
+// Operators on other hardware should run the benchmark and set workerThreads
+// explicitly.
 constexpr size_t kMaxAutoWorkerThreads = 8;
 
 template <typename T>
