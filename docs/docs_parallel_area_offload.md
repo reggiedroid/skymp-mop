@@ -154,6 +154,24 @@ condition variable and are nearly free. At 150 players the residual pool-size
 cost is larger, around 10%, but still nothing like the difference the unit count
 makes.
 
+> **Only while the pool fits the machine.** The table above was measured on a
+> host with at least 24 cores, so none of its rows oversubscribe. Repeating it
+> on an 8-core/16-thread part (`misc/parallel_bench`, 400 players, units
+> pinned) reproduces the shape up to 16 workers and then loses it: going from
+> 8 workers to 24 costs 12% at 16 units and 74% at 32, and the penalty arrives
+> exactly where the pool crosses the logical CPU count. Surplus threads are
+> nearly free while there is a CPU for each of them, and expensive once there
+> is not.
+>
+> It is not the spin. Dropping `workerSpinMicros` from 250 to 0 makes every
+> pool size worse, oversubscribed ones included, so the cost is not surplus
+> workers spinning before they park. Aggregate task time stays flat from 8
+> workers to 32 while the fork/join phase nearly triples, which puts the
+> difference in waiting rather than in work — consistent with the barrier
+> waiting on a claimant the scheduler has not run yet. Either way it is a
+> reason to keep the auto-sized pool bounded by the machine, which is what
+> `kMaxAutoWorkerThreads` and the physical-core estimate do.
+
 > **Correction.** An earlier revision of this page attributed the fall-off to
 > cache topology — two 8-core chiplets with separate L3 — citing "18 units on 8
 > workers took 546µs while 17 units on 30 workers took 1150µs". That comparison
@@ -436,6 +454,13 @@ produce all 144 relays with none throttled.
 The partitioner suite asserts the safety property directly: for every pair of
 actors placed in different clusters, they must be further apart than the
 separation distance.
+
+`unit/ParallelBenchmark.cpp` (`./unit/unit "[ParallelBench]"`) is the
+authority on what any of this costs, and it needs the full vcpkg build.
+Where that build is unavailable, `misc/parallel_bench` measures `ExecuteTick`
+alone from `parallel/*.cpp` and a compiler — less than the real thing, and
+enough to keep a tuning question from being answered by a model. Its README
+carries the numbers above.
 
 Two suites are worth knowing about specifically:
 
