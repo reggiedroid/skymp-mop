@@ -129,8 +129,9 @@ private:
 
   // Claims and runs tasks from `batchGeneration` until the batch is
   // exhausted or superseded. Touches `currentTasks` only after it has
-  // successfully claimed an index, which is what makes a straggler safe: see
-  // the comment on `cursor`.
+  // successfully claimed an index, and trusts a task count only when it
+  // carries the same generation as the batch being drained. That is what
+  // makes a straggler safe; see the comments on `cursor` and `batch`.
   void DrainTasks(size_t slotIndex, uint32_t batchGeneration);
 
   void RunTaskGuarded(const Task& task, size_t slotIndex,
@@ -194,18 +195,45 @@ private:
   // low 32. One word, so a worker can test "is this batch still mine" and
   // claim an index in a single compare-exchange.
   //
-  // That pairing is what makes a straggler harmless. A worker left over from
-  // the previous batch either fails the generation test and leaves, or fails
-  // the exchange because the word moved under it and retries into the same
-  // test. It can never consume an index belonging to a batch it is not part
-  // of -- which is exactly what the earlier fetch_add cursor allowed, and the
-  // failure was not a duplicated packet but a hung tick.
+  // That pairing is half of what makes a straggler harmless. A worker left
+  // over from the previous batch either fails the generation test and
+  // leaves, or fails the exchange because the word moved under it and
+  // retries into the same test. The other half is `batch`, below: the
+  // generation test is only as good as the count the index is compared
+  // against.
   std::atomic<uint64_t> cursor{ 0 };
 
   // Tasks finished in the current batch. Run waits on this rather than on
   // worker arrivals, so workers that never woke cost nothing.
   std::atomic<uint32_t> completedTasks{ 0 };
-  std::atomic<uint32_t> taskCount{ 0 };
+
+  // The current batch's generation in the high 32 bits and its task count in
+  // the low 32, packed like the cursor and for the same reason.
+  //
+  // This used to be a bare task count, and that reopened the hole the
+  // generation-tagged cursor was built to close. Run writes the count for
+  // batch N+1 before it publishes N+1 on the cursor, so for that interval the
+  // cursor still says N while the count already says N+1. A straggler from
+  // batch N that loaded the count in that interval saw the old, exhausted
+  // cursor pass its generation test, and when N+1 was the larger batch, it
+  // passed the index test too. It then claimed an index batch N never had,
+  // ran a task belonging to N+1 from the vector Run had just installed, and
+  // incremented N+1's completedTasks from outside the claim protocol.
+  //
+  // One extra increment is enough. completedTasks overshoots the count, the
+  // equality Run waits on is never true again, and the tick hangs for good:
+  // caught under a debugger with completedTasks at 41 for a batch of 40, the
+  // main thread in cvDone.wait and every worker parked. It needs a pooled
+  // batch to grow between ticks, which a crowd forming does routinely, and a
+  // worker preempted at the wrong instant, which an oversubscribed host does
+  // routinely: 28 of 40 runs of 300 growing batches hung with four threads
+  // on two cores, against none for the pool this one replaced.
+  //
+  // Tagging the count with its generation makes it self-validating: a
+  // straggler compares the tag with the generation it is draining and leaves
+  // on a mismatch, so it can only ever use the count of its own batch, and
+  // against its own exhausted batch no index is claimable.
+  std::atomic<uint64_t> batch{ 0 };
 
   // Read only after a worker has claimed an index, at which point Run is
   // provably still inside the call and the caller's vector is alive.

@@ -100,17 +100,23 @@ void ThreadPool::Run(const std::vector<Task>& tasks)
 
   const auto count = static_cast<uint32_t>(tasks.size());
 
-  // Safe without synchronisation: a straggler from the previous batch can
-  // only read `currentTasks` after claiming an index from a cursor whose
-  // generation still matches its own, and the previous batch's generation is
-  // about to stop matching anything.
-  currentTasks.store(&tasks, std::memory_order_relaxed);
-  completedTasks.store(0, std::memory_order_relaxed);
-  taskCount.store(count, std::memory_order_relaxed);
-
+  // Nothing can move the cursor while no batch is running: the previous
+  // batch is exhausted, and a claim needs an index below its own batch's
+  // count, so this read is of a quiescent word.
   const uint32_t generation = GenerationOf(cursor.load(
                                 std::memory_order_relaxed)) +
     1;
+
+  // Safe without synchronisation, including against a straggler from the
+  // previous batch that is still running its claim loop. It checks `batch`
+  // before it trusts a count, so it sees either its own generation, whose
+  // cursor is exhausted and leaves nothing to claim, or this one, which is not
+  // its own, and leaves. Either way it never reaches `currentTasks` or
+  // `completedTasks`. Writers of a later generation are published to real
+  // participants by the release store of the cursor below.
+  currentTasks.store(&tasks, std::memory_order_relaxed);
+  completedTasks.store(0, std::memory_order_relaxed);
+  batch.store(MakeCursor(generation, count), std::memory_order_relaxed);
 
   bool notifyWorkers = false;
   size_t toWake = 0;
@@ -206,7 +212,15 @@ void ThreadPool::WorkerMain(size_t slotIndex)
 
 void ThreadPool::DrainTasks(size_t slotIndex, uint32_t batchGeneration)
 {
-  const uint32_t count = taskCount.load(std::memory_order_relaxed);
+  // A count is only meaningful for the generation it was published with. A
+  // straggler that finds a later generation here has lost its batch: it ended
+  // without us, and the count is somebody else's. See the comment on `batch`
+  // for what happened when this was an untagged count.
+  const uint64_t descriptor = batch.load(std::memory_order_relaxed);
+  if (GenerationOf(descriptor) != batchGeneration) {
+    return;
+  }
+  const uint32_t count = IndexOf(descriptor);
 
   for (;;) {
     uint64_t current = cursor.load(std::memory_order_acquire);

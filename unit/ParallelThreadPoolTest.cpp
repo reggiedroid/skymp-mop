@@ -1,7 +1,9 @@
 #include "parallel/ThreadPool.h"
+#include <array>
 #include <atomic>
 #include <catch2/catch_all.hpp>
 #include <chrono>
+#include <deque>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -134,6 +136,70 @@ TEST_CASE("Alternating batch sizes stay consistent", "[ParallelPool]")
     }
     pool.Run(tasks);
     REQUIRE(ran.load() == count);
+  }
+}
+
+TEST_CASE("Growing batches never let a straggler cross the boundary",
+          "[ParallelPool]")
+{
+  // The shape `Alternating batch sizes stay consistent` cannot reach. Its
+  // short batch is a single task, which Run executes inline without touching
+  // the cursor, so every transition it puts through the claim protocol is
+  // 200 -> 200. The dangerous transition is a pooled batch followed by a
+  // *larger* one: a straggler from the small batch that loaded the large
+  // batch's task count while the cursor still named its own generation used
+  // to pass both claim tests, run a task of the next batch and bump that
+  // batch's completion counter from outside the protocol. The counter then
+  // overshot, the equality Run waits on was never true again, and the tick
+  // hung: the failure this pool's claim protocol was built to rule out.
+  //
+  // A regression here is as likely to hang as to fail an assertion.
+  //
+  // Oversubscribed on purpose: the window needs a worker preempted between
+  // reading the generation and reading the count, and a pool with twice as
+  // many threads as cores makes that routine. Against the untagged count this
+  // case hung on 20 of 20 runs on a 2-core host; at 300 rounds it was 12 of
+  // 20, which is too weak to guard a regression with. It costs about 50ms.
+  constexpr int kRounds = 2000;
+  constexpr int kSmall = 2;
+  constexpr int kLarge = 40;
+
+  // Outlive every round and the pool itself, so a straggler reaching into a
+  // finished batch shows up as a wrong count rather than as undefined
+  // behaviour that could hide it.
+  std::vector<std::array<std::atomic<int>, kLarge>> runs(kRounds);
+  std::deque<std::vector<ThreadPool::Task>> batches;
+
+  {
+    const size_t cores =
+      std::max<size_t>(1, std::thread::hardware_concurrency());
+    // Capped at 32, the largest pool the configuration can ask for.
+    ThreadPool pool(std::min<size_t>(cores * 2, 32));
+
+    for (int round = 0; round < kRounds; ++round) {
+      const int count = (round % 2 == 0) ? kSmall : kLarge;
+      auto& tasks = batches.emplace_back();
+      for (int i = 0; i < count; ++i) {
+        tasks.emplace_back(
+          [&runs, round, i](size_t) { runs[round][i].fetch_add(1); });
+      }
+      pool.Run(tasks);
+
+      // Run may not return until every task of its own batch has finished,
+      // and each of them exactly once.
+      for (int i = 0; i < count; ++i) {
+        REQUIRE(runs[round][i].load() == 1);
+      }
+    }
+  }
+
+  // The pool is gone, so every worker has been joined. A straggler that ran a
+  // task after its round was checked would have left a count of two.
+  for (int round = 0; round < kRounds; ++round) {
+    const int count = (round % 2 == 0) ? kSmall : kLarge;
+    for (int i = 0; i < count; ++i) {
+      REQUIRE(runs[round][i].load() == 1);
+    }
   }
 }
 
