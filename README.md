@@ -282,9 +282,10 @@ On a 8-core host running a busy server:
 Watch the log line, then tune:
 
 ```
-MpParallel: tick=5000 actors=214 clusters=37 biggest=151 units=58 (pooled 54)
-            relays=9871 throttled=0 parallel=2104us join=610us speedup=6.31x
-            declinedTotal=412 verdict=accept relays_from=join
+MpParallel: tick=5000 actors=214 clusters=37 biggest=151 chunks=96 units=58
+            (pooled 54) relays=9871 throttled=0 parallel=2104us join=610us
+            speedup=6.31x declinedTotal=412 verdict=accept relays_from=join
+            staleTotal=0
 ```
 
 A tick the gate declined prints a shorter line instead, and only when players
@@ -304,6 +305,14 @@ log nothing at all, which looks exactly like the feature being switched off.
 - `biggest` against `actors` tells you how concentrated your population is. When
   `biggest` is most of `actors`, sharding is doing the work, and `units` should
   be comfortably larger than `clusters`. If it is not, lower `minShardActors`.
+- `chunks` against `clusters` says how the population is laid out: `chunks` is
+  how many 4096-unit squares are occupied, `clusters` how many independent
+  groups those squares fall into. Hundreds of chunks in a handful of clusters
+  is a map with cities on it; one of each is a crowd.
+- `staleTotal` counts submissions whose actor had gone by the time the join
+  ran — a disconnect or a cell change between ingest and the join. A few
+  during churn are normal. Steadily climbing on a stable population is a bug
+  worth reporting.
 - `join` growing toward `parallel` means the serial tail is becoming the limit;
   more cores will not help past that point. With the default
   `relayFromWorkers: false` the join *also* carries every relay, so a large
@@ -350,6 +359,86 @@ Start here, and change one thing at a time:
 What it is worth: about 1.5× of `ExecuteTick` at 400 players. What it costs if
 the assumption is wrong: memory corruption in a running server. That is the
 trade, stated so it can be made deliberately.
+
+### What to expect from a few hundred players spread across a map
+
+The tables at the top of this file are a crowd: every player inside one chunk,
+everybody visible to everybody. A live server is usually something else —
+cities and markets with real crowds in them, most of the map thinly occupied,
+and parties walking between the two. That population is measured separately,
+by the `province` and `roaming` shapes in `misc/parallel_bench`, and it
+behaves differently in three ways worth knowing before the first test.
+
+**The gate will decline, most of the time, and that is the right answer.**
+Relay volume is what the offload parallelises, and it is quadratic in how many
+players can see *each other*, not in how many are logged in. 100 players
+spread over a province generate about 700 relay edges in a whole tick; 400
+players in one chunk generate 160,000. There is nothing in the first case for
+a fork and a join to repay, so `verdict=decline` on a quiet map is the gate
+working, not failing. It engages when a city fills, and the probe means it
+notices within four seconds.
+
+**Cluster count is not a density signal.** Clusters merge at four chunks'
+separation, so players strung along a road closer together than that join into
+one cluster however far apart the two ends are. On the `province` shape 800
+players across 337 occupied chunks came out as 14 clusters with 669 of them in
+the largest. That is not a bug — the separation is what makes a cluster safe
+to process on its own — but it does mean the parallelism comes from *sharding*
+the big cluster rather than from having many. Watch `units` against
+`clusters`, not `clusters` alone.
+
+**Below a few hundred movers the offloaded path is slower, and above it
+faster.** Both arms priced with the decline grounds forced off, three runs,
+median `ExecuteTick`, on an 8-core Ryzen 9 PRO 8945HS:
+
+| shape | 100 | 200 | 400 | 800 |
+| --- | --- | --- | --- | --- |
+| province | 0.36× | 0.59× | **1.36×** | **2.29×** |
+| roaming | 0.33× | 0.51× | **1.11×** | **1.87×** |
+
+Above 1.0 the offload is cheaper. These are `ExecuteTick` only — no ingest, no
+`PartOne` — so an end-to-end ratio will sit closer to 1.0 than these do. What
+they establish is the shape of the curve, and that the break-even on a map
+population is in the low hundreds rather than nowhere.
+
+**Expect `throttled` to be non-zero sooner than the budget suggests.** An area
+is judged under pressure against `targetTickBudgetMicros` divided by the
+cluster count, so on a population that merges into a few large clusters each
+one's share is a fraction of the tick, and the cluster holding a city will
+exceed its share while the tick as a whole is comfortable. What that costs is
+bounded and deliberate -- relays beyond the near band are spaced out, never
+dropped, and the near band is never smaller than 512 units -- so a non-zero
+`throttled` on a map population is expected rather than a sign of trouble.
+`adaptiveThrottling: false` switches the mechanism off if you would rather the
+first test measured without it.
+
+### When to stop the test
+
+Stop and set `enabled: false` — which returns the server to the original code
+path byte for byte — if any of these appear. Each is a symptom of something
+this branch could be wrong about, and none of them is a tuning problem:
+
+- Players report seeing each other teleport, stutter, or vanish at the edge of
+  a chunk, or stop seeing each other at all across a boundary. The offloaded
+  path recomputes the relay neighbourhood from positions instead of walking
+  the subscription lists; a mismatch would show up exactly there. (The two are
+  asserted identical on scattered maps, parties crossing boundaries, several
+  cities at once, and both relay modes, by `[ParallelWorld]` — but those are
+  the code's own terms, not a live client's.)
+- `staleTotal` in the metrics line climbing steadily while the population is
+  stable.
+- Any crash inside the send path, particularly with `relayFromWorkers: true`.
+  That setting is the one unverified concurrency assumption in this branch;
+  turn it off first and see whether the crash goes away, then report it either
+  way.
+- Tick time worse than it was with the subsystem off, on a population where
+  the metrics line says `verdict=accept`. That is the gate reaching the wrong
+  conclusion, and the numbers in the line are what makes it diagnosable.
+
+What to capture when reporting anything: the whole metrics line, the
+`parallelism` block from `server-settings.json`, and roughly how the
+population was distributed — one crowd, several cities, or spread out. The
+third of those is what decides which of the measurements above applies.
 
 ## One deliberate behavioural difference
 
@@ -415,6 +504,12 @@ config.
 ./unit/unit "[ParallelConfig],[ParallelBalancer]"
 ```
 
+```bash
+./unit/unit "[ParallelWorld]"    # cities, scatter, parties crossing chunks
+./unit/unit "[ParallelTrial]"    # the gate's caller contract
+./unit/unit "[ParallelSurface]"  # the API the live server compiles against
+```
+
 End-to-end parity against the real server lives in
 `unit/PartOne_MovementParallelTest.cpp`. It runs the same scenarios as
 `PartOne_MovementTest.cpp` with the offload enabled, driving the real
@@ -430,6 +525,25 @@ produce all 144 relays with none throttled.
 The partitioner suite asserts the safety property directly: for every pair of
 actors placed in different clusters, they must be further apart than the
 separation distance.
+
+`[ParallelWorld]` is the one that covers a live population rather than a
+crowd: a few hundred players across four cities, open country and interiors,
+parties walking at just under a chunk per tick, and players sitting exactly on
+a chunk seam. Every case compares the relays the offloaded path produces
+against a second implementation of the server's own rule — same grid,
+Chebyshev chunk distance at most one — and requires them identical, at one,
+three and eight workers, with relays emitted from the workers and from the
+join.
+
+`[ParallelTrial]` covers the contract a caller has to keep for the gate to
+work at all, including the two ways of breaking it that fail silently: a
+caller that never reports ingest time makes the trial decline for ever, and a
+caller that never asks before submitting is never trialled.
+
+`[ParallelSurface]` exists because `PartOne.cpp`, `ActionListener.cpp` and
+`PartOneOffloadSink.cpp` cannot be compiled without the vcpkg tree. It makes
+the same calls those three make, so a field or signature they depend on cannot
+quietly disappear on a host that can only build the parallel suite.
 
 Two suites are worth knowing about specifically:
 

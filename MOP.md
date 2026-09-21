@@ -9,11 +9,12 @@ original code path runs byte for byte.
 
 | | |
 | --- | --- |
-| Parallel offload | **2.17×** (400 players, measured) |
+| Parallel offload, one crowd | **2.17×** (400 players, measured) |
+| Parallel offload, a map with cities on it | **2.29×** (800 players, measured; was 0.69×) |
 | Interest management | **1.39×** (400 players, 160k relays down to 120k) |
 | Legacy JSON ingest | **3.4–6.3×** (closes `TODO(#2257)`) |
 | Hang bugs fixed | 2 tick-stopping races |
-| Tests | 75 parallel cases, 97,589 assertions |
+| Tests | 95 parallel cases, 845,757 assertions, clean under ASan and TSan |
 | Risk if unused | 0 — off by default |
 
 ---
@@ -86,6 +87,20 @@ The parallel phase itself is not the limit. The ceiling is the join: at 400
 players, emitting 160,000 relays serially costs 275µs of a 551µs tick *even
 with a no-op send target*. No amount of parallelism fixes that; sending fewer
 relays does.
+
+**On a map rather than a crowd, the limit was somewhere else entirely.** Every
+figure above is one chunk of players. A live server is cities and markets with
+crowds in them, most of the map thinly occupied, and parties walking between
+the two — hundreds of occupied chunks instead of one. In that shape most of
+the tick went on working out *where everyone was*: the partitioner probed a
+hash table for each of the eighty cells around every occupied chunk, and timed
+on its own that pass cost 705µs for 800 players spread over 718 chunks.
+Walking only the forward half of that window, and finding each column by
+binary search into the already-sorted chunk list, takes the same pass to
+72µs. On the province population the whole offloaded tick went from 0.69× of
+the serial path to 2.29×, which is most of the tick accounted for by that one
+pass. Measured three runs each, before and after, by `misc/parallel_bench`;
+the tables are in its README.
 
 ### 3. JSON deserializer — unconditional
 
@@ -193,9 +208,18 @@ A pitch that only lists upsides is one you should distrust.
   a no-op send target, so it measures server-side relay cost, not the network
   stack. A live test with hundreds of real clients would confirm or move these
   figures, and it has not been run.
-- **One machine, one topology.** All figures come from a single 32-core host with
-  every player in one chunk. Re-run the benchmark on target hardware before
-  tuning.
+- **One machine.** Every figure here comes from one host. Re-run the benchmark
+  on target hardware before tuning anything.
+- **Two topologies, not many.** The headline table is one chunk of players;
+  the map figures are a synthetic province of four cities, open country and
+  interiors, with parties crossing chunk boundaries. A real server's
+  population is neither, and the one number that decides which of them it
+  resembles — relay edges per tick — is in the metrics line for anyone who
+  wants to check.
+- **The offload declines on a thinly occupied map, and should.** 100 players
+  spread out generate around 700 relay edges a tick against 160,000 for 400
+  players in one square. The gate measures both paths and hands those ticks
+  back to the original code; that is the design working, not a shortfall.
 
 ## Two behavioural differences when enabled
 
