@@ -103,7 +103,8 @@ struct Result
 // case, which is the shape the framework exists for.
 Result Run(size_t players, size_t workers, size_t maxShards,
            uint32_t minShardMicros, int ticks, int warmup,
-           bool forceInline = false, uint32_t spinMicros = UINT32_MAX)
+           bool forceInline = false, uint32_t spinMicros = UINT32_MAX,
+           bool forceAccept = false)
 {
   ParallelConfig config;
   config.enabled = true;
@@ -120,9 +121,21 @@ Result Run(size_t players, size_t workers, size_t maxShards,
   // fan-out rather than how much of it was skipped.
   config.adaptiveThrottling = false;
   config.interestManagement = false;
-  // A control loop keyed on wall clock would make every number below a
-  // function of the numbers before it.
+  // Always off. A control loop keyed on wall clock would make
+  // every number below a function of the numbers before it, and this harness
+  // cannot judge the trial anyway -- see the note on the last section, which
+  // explains why a caller that does not report ingest time makes the trial
+  // decline unconditionally.
   config.adaptiveParallelism = false;
+
+  // Both decline grounds switched off, which is what the documented
+  // `minOffloadWorkMicros: 0` is for. Used to price the offloaded path on a
+  // population the gate would normally refuse, so that what the gate decided
+  // can be checked against what the two paths actually cost.
+  if (forceAccept) {
+    config.minOffloadWorkMicros = 0;
+    config.minOffloadSpeedup = 0.f;
+  }
 
   if (maxShards > 0) {
     config.maxShardsPerCluster = maxShards;
@@ -352,6 +365,71 @@ int main(int argc, char** argv)
     }
     printf("%10u %11.1f %10.1f %7.2fx %7zu\n", micros, r.medianMicros,
            r.p90Micros, r.speedup, r.workUnits);
+  }
+
+  // What the two paths cost on the same population, with both decline
+  // grounds switched off so there is a number even where the gate would
+  // refuse. This is the comparison the gate is trying to make.
+  //
+  // It deliberately stops short of scoring the gate's own decision, and the
+  // reason is a trap worth knowing about. The paired trial prices a tick as
+  // `ingestNanosThisTick + lastParallelMicros + lastJoinMicros`. On a
+  // declined tick the last two are zero, so the whole cost is whatever the
+  // caller reported through AddIngestNanos -- and a caller that does not
+  // implement WillAcceptThisTick / IsMeasuringThisTick / AddIngestNanos
+  // reports nothing. The declined arm then costs zero per mover, no accepted
+  // arm can beat it, and the trial declines forever.
+  //
+  // This harness is such a caller: it drives the dispatcher directly and has
+  // no inline path to charge for. Engagement measured here would therefore be
+  // a property of the harness, not of the decision procedure, so it is not
+  // reported. ActionListener does implement the contract; unit/ParallelBench-
+  // mark.cpp drives ActionListener, and that is where the gate can be judged.
+  Header("Both paths priced with the gate forced (see note on the trial)");
+  printf("%9s %12s %12s %10s %12s\n", "players", "inline us", "offload us",
+         "cheaper", "ratio");
+  for (size_t players : { size_t(100), size_t(200), size_t(400) }) {
+    // Both paths priced with the decline grounds off. For the inline arm that
+    // means the dispatcher accepts the tick and then runs it serially,
+    // because minActorsToOffload is out of reach -- which is the serial cost
+    // of the same work, and the only inline number this harness can produce.
+    const Result inlineRun = Run(players, 0, 0, 0, ticks, warmup,
+                                 /*forceInline=*/true, UINT32_MAX,
+                                 /*forceAccept=*/true);
+    // Priced with both decline grounds off, so there is a number even where
+    // the gate would refuse. That refusal is the thing under test; measuring
+    // only what the gate already agreed to would assume the answer.
+    const Result offload = Run(players, 0, 0, 0, ticks, warmup, false,
+                               UINT32_MAX, /*forceAccept=*/true);
+    const char* cheaper = "?";
+    double ratio = 0.0;
+    if (!inlineRun.declined && !offload.declined && offload.medianMicros > 0.0) {
+      ratio = inlineRun.medianMicros / offload.medianMicros;
+
+      // A deadband, because this harness overstates the gap: it excludes the
+      // ingest and deserialization both paths pay, so a ratio here is always
+      // further from 1.0 than the same ratio measured end to end. Calling a
+      // 1.1x difference a win either way would be reading precision this
+      // benchmark does not have.
+      cheaper = ratio >= 1.25 ? "offload" : (ratio <= 0.8 ? "inline" : "near-tie");
+    }
+
+    printf("%9zu ", players);
+    if (inlineRun.declined) {
+      printf("%12s ", "declined");
+    } else {
+      printf("%12.1f ", inlineRun.medianMicros);
+    }
+    if (offload.declined) {
+      printf("%12s ", "declined");
+    } else {
+      printf("%12.1f ", offload.medianMicros);
+    }
+    if (ratio > 0.0) {
+      printf("%10s %11.2fx\n", cheaper, ratio);
+    } else {
+      printf("%10s %12s\n", cheaper, "-");
+    }
   }
 
   return 0;
