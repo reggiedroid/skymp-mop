@@ -63,13 +63,27 @@ TEST_CASE("Slot indices stay inside the advertised range", "[ParallelPool]")
   ThreadPool pool(3);
   REQUIRE(pool.GetSlotCount() == 4);
 
+  // A task may only record what it saw; the assertions run on the calling
+  // thread once Run has drained the batch. Catch2's macros are not
+  // thread-safe, and the 400 in-task REQUIREs this replaces were losing
+  // counts: a suite that runs a fixed number of assertions reported a
+  // different total nearly every run, 97,983 to 97,986 over 8.
+  //
+  // Directly, with 8 threads issuing 5,000 REQUIREs each and counting their
+  // own calls: the lambdas made all 40,000 every run, and Catch2 reported
+  // 39,910 / 39,990 / 38,185 / 36,714 / 36,628. Its counter is a plain
+  // non-atomic increment, so the reads and writes interleave and updates are
+  // lost. ThreadSanitizer does not flag it -- 30 clean runs of this suite,
+  // and 6 of the version before this change -- because the workers are
+  // already ordered against each other by the pool's own acquire-release
+  // cursor. A silent TSan is not evidence that a cross-thread REQUIRE is
+  // safe.
   std::mutex mutex;
   std::set<size_t> seenSlots;
 
   std::vector<ThreadPool::Task> tasks;
   for (size_t i = 0; i < 400; ++i) {
     tasks.emplace_back([&](size_t slot) {
-      REQUIRE(slot < 4);
       std::lock_guard<std::mutex> lock(mutex);
       seenSlots.insert(slot);
     });
@@ -77,8 +91,52 @@ TEST_CASE("Slot indices stay inside the advertised range", "[ParallelPool]")
 
   pool.Run(tasks);
 
-  // The caller always participates, so slot 0 must show up.
-  REQUIRE(seenSlots.count(0) == 1);
+  // Which slots draw work is a scheduling outcome. That every one of them is
+  // a legal index is the contract, and it is all this case may assert; see
+  // `The calling thread owns slot 0` for the part about slot 0.
+  REQUIRE_FALSE(seenSlots.empty());
+  REQUIRE(*seenSlots.rbegin() < pool.GetSlotCount());
+}
+
+TEST_CASE("The calling thread owns slot 0", "[ParallelPool]")
+{
+  // The case above used to end with `REQUIRE(seenSlots.count(0) == 1)`,
+  // reading ThreadPool.h's "slot 0 is always the calling thread" as a promise
+  // that the caller runs work. It promises which index the caller passes, not
+  // that it wins a claim. Run publishes the cursor, notifies the workers, and
+  // only then enters the claim loop itself, so workers that wake while the
+  // caller is still issuing notifications can take all 400 indices before its
+  // first compare-exchange lands. Nothing is wrong when they do: the caller
+  // waits on the tasks either way.
+  //
+  // That is not hypothetical: on an 8-core/16-thread host it cost 2 of 10
+  // whole-suite runs, while the case passed 40 of 40 on its own. Running the
+  // rest of the suite first is what makes the caller late, so the more
+  // hardware there is to lose the race on, the less the case tested.
+  //
+  // The inline path is where the contract is decidable. With no workers, or
+  // with a batch too small to be worth a barrier, Run executes the tasks
+  // itself and every one of them sees slot 0.
+  std::set<size_t> seenSlots;
+  const ThreadPool::Task record = [&seenSlots](size_t slot) {
+    seenSlots.insert(slot);
+  };
+
+  SECTION("a pool with no workers takes every task")
+  {
+    ThreadPool pool(0);
+    std::vector<ThreadPool::Task> tasks(64, record);
+    pool.Run(tasks);
+  }
+
+  SECTION("a lone task runs inline even on a pool that has workers")
+  {
+    ThreadPool pool(3);
+    std::vector<ThreadPool::Task> tasks(1, record);
+    pool.Run(tasks);
+  }
+
+  REQUIRE(seenSlots == std::set<size_t>{ 0 });
 }
 
 TEST_CASE("Repeated batches all complete", "[ParallelPool]")

@@ -53,9 +53,11 @@ constexpr uint32_t kDefaultSpinMicros = 250;
 //    cursor and pick it up in nanoseconds.
 //
 // Each task receives a worker index in [0, GetSlotCount()). Slot 0 is always
-// the calling thread. Callers use the index to reach per-slot scratch
-// buffers, which is what keeps the parallel phase allocation-free and
-// lock-free.
+// the calling thread, which is not the same as the caller always running a
+// task: it joins the same claim loop as the workers and can find the batch
+// already taken. Callers use the index to reach per-slot scratch buffers,
+// which is what keeps the parallel phase allocation-free and lock-free, so a
+// buffer is needed for every slot even on ticks that leave some unused.
 class ThreadPool
 {
 public:
