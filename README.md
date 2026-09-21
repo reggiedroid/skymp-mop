@@ -19,10 +19,11 @@ diverge from it.
 
 | | |
 | --- | --- |
-| Crowded-area tick | **1.39×** — 400 players, measured |
+| Parallel offload | **2.17×** — 400 players, measured |
+| Interest management | **1.39×** — 400 players, 160k relays down to 120k |
 | Legacy JSON ingest | **3.4–6.3×** — closes upstream `TODO(#2257)` |
-| Hang bugs fixed | 1 tick-stopping race |
-| Tests | 480,346 assertions · 310 cases · 12/12 ctest |
+| Hang bugs fixed | 2 tick-stopping races |
+| Tests | 75 parallel cases · 97,589 assertions |
 | Risk if unused | 0 — off by default |
 
 Jump to: [what it costs, measured](#what-it-actually-costs-measured) ·
@@ -111,20 +112,25 @@ on faith:
 
 Every player in one chunk, everyone sending movement every tick, timing the
 full ingest **plus** `PartOne::Tick` so both paths are compared over the same
-unit of work. 32-core host, binary wire format:
+unit of work. 16-core/32-thread Ryzen 9950X3D, binary wire format:
 
 | players | 25 | 50 | 100 | 150 | 250 | 400 |
 | --- | --- | --- | --- | --- | --- | --- |
-| speedup | 0.25× | 0.43× | 0.66× | 0.81× | 0.88× | **1.10×** |
+| speedup | 0.85× | 0.88× | 0.99× | **1.29×** | **1.87×** | **2.17×** |
 
-**Break-even is around 300–400 players.** Below that the offload is a
-regression: barrier and snapshot costs are paid every tick while the parallel
-phase is still small. That is why `minActorsToOffload` defaults to 300 rather
-than to something optimistic.
+**Break-even is around 100 players.** Below that the offload is a regression:
+barrier and snapshot costs are paid every tick while the parallel phase is
+still small. That is why `minActorsToOffload` defaults to 100 rather than to
+something optimistic.
 
-The parallel phase itself scales fine — at 400 players it completes 966µs of
-task work in 96µs of wall clock, roughly 10×. The ceiling is elsewhere: the
-join emits 160,000 relays serially and costs 787µs of an 1118µs tick, *even
+Break-even used to sit near 300–400 (0.25×/0.43×/0.66×/0.81×/0.88×/1.10× for
+the same populations). What moved it was not the parallel phase, which was
+always small, but the three serial costs around it: the per-tick barrier, a
+join that made one virtual call per relay edge, and shards sized by actor
+count rather than by work.
+
+The ceiling now is the join: at 400 players it emits 160,000 relays serially
+and costs 275µs of a 551µs tick, *even
 with a send target that does nothing*. Parallelising decisions cannot fix
 that. Sending fewer relays can, which is what interest management is for.
 
@@ -146,7 +152,7 @@ behaviour knobs.
 Relay volume is the quadratic term, and emitting those sends is serial no
 matter how many cores decided them. So the highest-value lever is sending
 less — and unlike the offload, it helps at every population rather than only
-above 300.
+above 100.
 
 Recipients closer than `interestFullRateUnits` (2048 by default, about half a
 chunk) always receive every update, so anything a player is realistically
@@ -200,9 +206,10 @@ Add a `parallelism` object to `server-settings.json`:
   "parallelism": {
     "enabled": true,
     "workerThreads": 0,
-    "minActorsToOffload": 300,
+    "minActorsToOffload": 100,
     "minClusterActors": 4,
     "minShardActors": 4,
+    "minShardMicros": 20,
     "maxShardsPerCluster": 0,
     "clusterSeparationChunks": 4,
     "interestManagement": true,
@@ -221,22 +228,26 @@ Add a `parallelism` object to `server-settings.json`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Master switch. Off means the original code path, byte for byte. |
-| `workerThreads` | `0` | `0` auto-detects: cores minus two, reserved for the Node main thread and the async save thread. Capped at 32. |
-| `minActorsToOffload` | `300` | Below this the fork/join barrier costs more than it saves — measured, see the table above. Lowering it makes the server slower. |
+| `workerThreads` | `0` | `0` auto-detects: *physical* cores (not SMT siblings) minus one for the Node main thread, capped at 8. The cap bounds the auto-sized work-unit count via the `slots × 2` ceiling, which is the quantity measurement showed to matter. An explicit value is bounded only by 32. |
+| `minActorsToOffload` | `100` | Below this the fork/join barrier costs more than it saves — measured, see the table above. Break-even used to sit near 300 and moved to 100 once the barrier, the join and shard sizing were fixed. |
 | `interestManagement` | `true` | Distance-based update-rate reduction, always on. The highest-value setting here. |
 | `interestFullRateUnits` | `2048` | Recipients closer than this always get every update. |
 | `maxInterestSkipTicks` | `4` | Ceiling on how far apart interest management may space an update. |
 | `minClusterActors` | `4` | Clusters smaller than this are swept up on the main thread instead of getting their own task. |
 | `minShardActors` | `4` | Fewest players a shard of a crowded cluster may carry. Lower splits a crowd more finely; too low and per-task overhead starts to show. |
 | `maxShardsPerCluster` | `0` | `0` auto-sizes to twice the slot count. Raise only if profiling shows one area still bottlenecking. |
+| `minShardMicros` | `20` | Smallest estimated work, in µs, that justifies its own shard. A quiet tick collapses to one unit and skips the barrier. Raising it starves the unit count: 95 cost 25% and 150 cost 53% in `misc/parallel_bench`. |
+| `workerSpinMicros` | `250` | How long a worker spins on the cursor before parking. Measured well chosen — dropping it to 0 cost 18–93% at every pool size tried. |
 | `clusterSeparationChunks` | `4` | Chunk distance separating clusters. Clamped up to 3. Raise it if you want more margin, at the cost of merging nearby crowds. |
 | `maxWorkUnitsPerTick` | `0` | `0` is unlimited. Units past the limit run on the calling thread. |
-| `repartitionIntervalTicks` | `30` | Reserved for incremental repartitioning. |
 | `adaptiveThrottling` | `true` | Enables the degradation described above. Only ever activates under measured overload. |
 | `targetTickBudgetMicros` | `8000` | Wall-clock target for the parallel phase. Overshooting raises pressure. |
 | `throttleDistanceUnits` | `4096` | Relays closer than this are never throttled. One exterior cell. |
 | `maxThrottleSkipTicks` | `3` | Hard ceiling on how far apart a throttled relay may be spaced. |
 | `metricsLogIntervalTicks` | `0` | `0` disables. Otherwise logs a summary line every N ticks. |
+| `adaptiveParallelism` | `false` | Raises the effective `minActorsToOffload` at run time when the pool is measurably not paying for itself. Off by default and **unmeasured** — no benchmark here shows it helping. |
+| `adaptiveBias` | `1.05` | How much slower than serial the offload may be before a tick counts against it. Only read when `adaptiveParallelism` is on. |
+| `adaptiveDecayTicks` | `10` | How often, in ticks, a raised threshold decays back toward `minActorsToOffload`, which is also its floor. |
 
 ### Suggested starting point
 

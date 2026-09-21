@@ -9,10 +9,11 @@ original code path runs byte for byte.
 
 | | |
 | --- | --- |
-| Crowded-area tick | **1.39×** (400 players, measured) |
+| Parallel offload | **2.17×** (400 players, measured) |
+| Interest management | **1.39×** (400 players, 160k relays down to 120k) |
 | Legacy JSON ingest | **3.4–6.3×** (closes `TODO(#2257)`) |
-| Hang bugs fixed | 1 tick-stopping race |
-| Tests | 480,346 assertions, 310 cases, 12/12 ctest |
+| Hang bugs fixed | 2 tick-stopping races |
+| Tests | 75 parallel cases, 97,589 assertions |
 | Risk if unused | 0 — off by default |
 
 ---
@@ -71,16 +72,20 @@ every core.
 
 | players | 25 | 50 | 100 | 150 | 250 | 400 |
 | --- | --- | --- | --- | --- | --- | --- |
-| speedup | 0.25× | 0.43× | 0.66× | 0.81× | 0.88× | **1.10×** |
+| speedup | 0.85× | 0.88× | 0.99× | **1.29×** | **1.87×** | **2.17×** |
 
-**Break-even sits near 300–400 players**, which is why `minActorsToOffload`
-defaults to 300 and not to something optimistic.
+**Break-even sits near 100 players**, which is why `minActorsToOffload`
+defaults to 100.
 
-The parallel phase itself is not the limit — at 400 players it retires 966µs of
-task work in 96µs of wall clock, about tenfold. The ceiling is the join:
-emitting 160,000 relays serially costs 787µs of an 1118µs tick *even with a
-no-op send target*. No amount of parallelism fixes that; sending fewer relays
-does.
+It used to sit near 300–400 (0.25×/0.43×/0.66×/0.81×/0.88×/1.10× for the same
+populations). The parallel phase was never what moved: it was already small.
+Three serial costs around it were — the per-tick barrier, a per-relay-edge
+join, and shards sized by actor count rather than by work.
+
+The parallel phase itself is not the limit. The ceiling is the join: at 400
+players, emitting 160,000 relays serially costs 275µs of a 551µs tick *even
+with a no-op send target*. No amount of parallelism fixes that; sending fewer
+relays does.
 
 ### 3. JSON deserializer — unconditional
 
@@ -104,21 +109,24 @@ timing only one half would flatter whichever was picked.
 
 ---
 
-## The bug that justifies the branch on its own
+## The bugs that justify the branch on their own
 
-`ThreadPool::Run` returned as soon as the task counter hit zero — but the worker
-that ran the final task decrements that counter and only *then* loops back to
-check the task cursor. If `Run` returned in that window and the next tick started
-a batch, the cursor reset handed the still-draining worker index 0 of the
-*previous* task vector.
+Both are in code MOP introduces. Neither is a latent bug in base SkyMP today.
+They are the class of bug that any threading work invites, which is why the
+branch ships the experiments that provoked them rather than a passing test and
+a shrug.
 
-The failure mode is not a duplicated packet: the straggler decrements a counter
-it was never part of, underflowing it, so the barrier never releases — **the
-server tick hangs permanently.**
+**The straggler.** `ThreadPool::Run` returned as soon as the task counter hit
+zero — but the worker that ran the final task decrements that counter and only
+*then* loops back to check the task cursor. If `Run` returned in that window
+and the next tick started a batch, the cursor reset handed the still-draining
+worker index 0 of the *previous* task vector. The failure mode is not a
+duplicated packet: the straggler decrements a counter it was never part of,
+underflowing it, so the barrier never releases — **the server tick hangs
+permanently.**
 
-The natural window is a few instructions wide, so nothing failed on an idle
-machine. To establish it was real rather than theoretical, we reverted only the
-fix and inserted a 300µs delay where a straggler would sit:
+The window is a few instructions wide, so nothing failed on an idle machine.
+Reverting only the fix and inserting a 300µs delay where a straggler would sit:
 
 ```
 Alternating batch sizes stay consistent
@@ -126,10 +134,34 @@ Alternating batch sizes stay consistent
   with fix + widened window   passed  3 of 3 runs
 ```
 
-This race is in code MOP introduces — it is **not** a latent bug in base SkyMP
-today. It is the class of bug that any threading work invites, and it is why the
-branch ships the delay-injection experiment documented rather than a passing
-test and a shrug.
+The fix is structural rather than a second wait condition. The cursor carries
+the batch generation in its high 32 bits and the next task index in its low
+32, and a worker claims work with one compare-exchange over both.
+
+**The claim-protocol hole.** Tagging the cursor was not enough on its own. The
+task count it is compared against was left untagged, and `Run` wrote the next
+batch's count *before* publishing that batch on the cursor. For that interval
+a straggler saw its own exhausted cursor pass the generation test and the
+larger count pass the index test, ran a task belonging to the next batch, and
+incremented that batch's completion counter from outside the protocol. One
+extra increment is enough: the equality `Run` waits on never holds again, and
+the tick hangs. Caught under gdb with `completedTasks` at 41 for a count of
+40.
+
+300 rounds alternating pooled batches of 2 and 40, 4 threads on 2 cores:
+
+```
+pool                       uninjected     300µs delay injected
+as first committed         28/40 HUNG     30/40 corrupted
+this branch                40/40 clean    40/40 clean
+```
+
+The count is now packed with its own generation. `Growing batches never let a
+straggler cross the boundary` is the guard; the older `Alternating batch sizes
+stay consistent` cannot be, because its short batch is a single task that runs
+inline without touching the cursor. ThreadSanitizer is no help either — every
+access in the failing sequence is atomic, so there is no data race to report,
+and 450 clean TSan runs said nothing about it.
 
 ---
 
@@ -154,8 +186,8 @@ test and a shrug.
 
 A pitch that only lists upsides is one you should distrust.
 
-- **The offload is a regression below ~300 players.** At typical population it is
-  slower. That is why it defaults off and why the threshold is 300. On a normal
+- **The offload is a regression below ~100 players.** At typical population it is
+  slower. That is why it defaults off and why the threshold is 100. On a normal
   server the useful half of this work is interest management.
 - **No real-client load test yet.** The benchmark drives the server directly with
   a no-op send target, so it measures server-side relay cost, not the network
@@ -193,7 +225,7 @@ Then in `server-settings.json`:
 ```json5
 "parallelism": {
   "enabled": true,
-  "workerThreads": 0,          // auto: cores minus two
+  "workerThreads": 0,          // auto: physical cores minus one, capped at 8
   "interestManagement": true,  // the setting that matters most
   "metricsLogIntervalTicks": 5000
 }

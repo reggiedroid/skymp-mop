@@ -233,6 +233,18 @@ Measured on the same benchmark, 400 players spread across one chunk:
 does nothing. With real RakNet sends, each avoided relay also skips
 serialization and queueing, so the gap widens.
 
+> **These three rows predate the table above and have not been re-measured.**
+> Their own arithmetic is consistent — 1233/890 is the 1.39× claimed — but
+> their offload-only row puts the offload at 1233/1048, or 1.18×, at 400
+> players, where the measured table above says 2.17×. Both cannot describe the
+> same build. The 1.18× is close to the 1.10× that table records for the *old*
+> offload, so the likeliest reading is that this comparison was taken before
+> the barrier, join and shard-sizing fixes and was not re-run when they
+> landed. Treat the 1.39× as a lower bound on what interest management is
+> worth, and re-run `./unit/unit "[ParallelBench]"` to replace the row.
+> Nothing here has been adjusted to fit, because a number nobody measured is
+> what this page exists to avoid.
+
 The phase of each reduced pair is derived from a hash of the pair, so traffic
 spreads evenly across the window instead of bursting. `[ParallelOffload]`
 asserts that every pair still transmits exactly once per window: reduced
@@ -482,11 +494,25 @@ Two suites are worth knowing about specifically:
   published, which is what makes a four-task batch cost four wakeups on a
   thirty-worker pool instead of thirty.
 
-  `Alternating batch sizes stay consistent` is the test that actually catches
-  it — a long batch followed by a one-task batch is what leaves a worker
-  draining across the boundary. The natural window is only a few instructions
-  wide, so this test is a guard against regression under load, not a reliable
-  detector on an idle machine.
+  Tagging the cursor was not by itself enough. The count it is compared
+  against was left untagged, which reopened the same hole: `Run` wrote the
+  next batch's count before publishing that batch on the cursor, so for that
+  interval a straggler saw its own exhausted cursor pass the generation test
+  and a larger count pass the index test. It then ran a task of the next batch
+  and incremented that batch's completion counter from outside the protocol,
+  and one extra increment is enough for the equality `Run` waits on never to
+  hold again. The count is now packed with its own generation, so a straggler
+  can only ever use the count of its own batch.
+
+  `Growing batches never let a straggler cross the boundary` is the guard.
+  `Alternating batch sizes stay consistent` cannot be: its short batch is a
+  single task, which `Run` executes inline without touching the cursor, so
+  every transition it puts through the claim protocol is 200 → 200, where a
+  stale-forward count opens no claimable index. The dangerous shape is a
+  pooled batch followed by a *larger* one, which is what the new case drives,
+  2000 rounds of it on an oversubscribed pool. ThreadSanitizer is no help
+  either — every access in the failing sequence is atomic, so there is no data
+  race to report.
 - `[ParallelOffload]` asserts that sharding is behaviour-neutral: the same
   population processed as one unit and as sixteen produces byte-identical
   relay sequences, in the same order.
