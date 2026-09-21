@@ -1,10 +1,24 @@
 #include "ParallelConfig.h"
-
 #include "CoreCount.h"
+
 #include <algorithm>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#if defined(_M_X64) || defined(_M_IX86)
+#include <intrin.h>
+#endif
+#elif defined(__linux__)
+#include <fstream>
+#include <string>
+#include <unordered_set>
+#endif
 
 namespace MpParallel {
 
@@ -36,23 +50,30 @@ namespace {
 // which measured at or near the optimum for every population tried. It also
 // keeps the residual pool-size cost small on machines with many cores.
 //
-// An earlier version of this comment claimed the fall-off past 8 was cache
-// topology (two 8-core chiplets with separate L3). That was wrong: the
-// evidence cited for it was measured before the wake-accounting fix in the
-// same change, where Run re-woke workers Prime had already woken, so the
-// large-pool figure was paying surplus thread wakeups rather than cross-die
-// transfers. With the unit count pinned there is no such cliff.
+// The cap stays at 8, on measurement.
 //
-// A later change raised this to 32, citing a projection model. That has been
-// reverted. The model caps its own worker search at 8, and its only
-// worker-count penalty is a flat per-shard constant, so it cannot produce a
-// fall-off and cannot be evidence that there is none. The measurements above
-// are the evidence that exists, and they argue the other way: with the pool at
-// 24, going from 8 units to 16 costs 4%, and the auto shard ceiling is
-// slots * 2, so a cap of 32 would auto-size up to 64 units.
+// It was briefly raised to 32, on the grounds that the 8 was an artefact of
+// the wake-accounting bug and that "simulation and benchmarking on 16-core and
+// AWS Graviton/Ice Lake systems" showed clean scaling past it. Neither holds:
+// the 8 was measured *after* that bug was fixed, no Graviton or Ice Lake
+// hardware was ever run, and perf_model.py -- the simulation in question --
+// hardcodes `min(physical - 1, 8)` as its own worker rule, so it never modelled
+// the change at all. Its per-platform IPC and barrier multipliers are
+// hand-authored estimates, not calibrations.
 //
-// Operators on other hardware should run the benchmark and set workerThreads
-// explicitly.
+// Re-measured on this machine, uncapping cost real time (us/tick, one chunk):
+//
+//     players            150     400
+//     cap 8             150.6   615.4
+//     cap 32            198.0   650.5
+//
+// At 400 players it raised the auto unit count from 18 to 31, which the
+// `Idle threads` table already showed is the wrong direction.
+//
+// 8 is not a universal optimum and is not claimed to be one. It is the largest
+// value with evidence behind it on the only hardware anyone has run. Operators
+// on a bigger machine should run ParallelBenchmark and set workerThreads
+// explicitly -- an explicit value is bounded only by kMaxWorkerThreads.
 constexpr size_t kMaxAutoWorkerThreads = 8;
 
 template <typename T>
@@ -88,8 +109,9 @@ void ParallelConfig::Normalize()
 {
   if (workerThreads == 0) {
     // Physical cores, bounded by what this process may actually run on
-    // (see CoreCount.h). One of them is left for the Node/V8 thread that
-    // drives ScampServer::Tick.
+    // (see CoreCount.h): an affinity mask or a cgroup quota makes the host's
+    // core count the wrong answer. One core is left for the Node/V8 thread
+    // that drives ScampServer::Tick.
     const size_t physical = GetPhysicalCoreCount();
     workerThreads = physical > 1 ? physical - 1 : 1;
     workerThreads = std::min(workerThreads, kMaxAutoWorkerThreads);
@@ -103,18 +125,37 @@ void ParallelConfig::Normalize()
   minClusterActors = std::max<size_t>(minClusterActors, 1);
   minActorsToOffload = std::max<size_t>(minActorsToOffload, 1);
   minShardActors = std::max<size_t>(minShardActors, 1);
+  
+  // No vendor branch here.
+  //
+  // A previous revision tripled minShardMicros on Intel parts, citing
+  // "simulation and benchmarks show 55-95us is optimal for Ice Lake". No Intel
+  // hardware was ever run; the figure comes from perf_model.py, whose Ice Lake
+  // profile is a hand-written `ipc=0.75, barrier_scale=1.8` guess rather than
+  // a calibration. Shipping a real behaviour change on a modelled constant is
+  // how a server ends up slow for a reason nobody can reproduce.
+  //
+  // It was also unable to do what it claimed. The test `minShardMicros == 20`
+  // cannot tell "the operator left the default" from "the operator measured
+  // their hardware and chose 20", so it silently overrode explicit
+  // configuration on every Intel host.
+  //
+  // The setting is already self-calibrating in the way that matters: the shard
+  // budget divides *measured* per-actor cost by it, so a slower machine
+  // naturally produces the same shard sizes in wall-clock terms. If a vendor
+  // split turns out to be real, it needs a measurement on that vendor's
+  // hardware first.
   minShardMicros = std::max<uint32_t>(minShardMicros, 1);
 
   // A spin longer than the tick period would keep every worker on a core for
   // the whole frame, which is the failure mode this is meant to avoid.
   workerSpinMicros = std::min<uint32_t>(workerSpinMicros, 5000);
 
-  // Prevent division-by-zero in the adaptive decay modulo check.
-  adaptiveDecayTicks = std::max<uint32_t>(adaptiveDecayTicks, 1);
-  // A bias below 1.0 would demand the offload beat serial execution on a
-  // machine where the two are within noise of each other, so every tick would
-  // count against the pool and the threshold would ratchet up for good.
-  adaptiveBias = std::max(adaptiveBias, 1.0f);
+  // Negative would accept everything; the disable value is exactly 0.
+  minOffloadSpeedup = std::max(minOffloadSpeedup, 0.f);
+  abTrialBlockTicks = std::max<uint32_t>(abTrialBlockTicks, 1);
+  // At least one block per arm, or a "trial" would only ever measure one path.
+  abTrialBlocks = std::max<uint32_t>(abTrialBlocks, 2);
 
   if (targetTickBudgetMicros == 0) {
     targetTickBudgetMicros = 8000;
@@ -148,10 +189,18 @@ ParallelConfig ParallelConfig::FromServerSettings(
   config.enabled = ReadBool(j, "enabled", config.enabled);
   config.adaptiveParallelism =
     ReadBool(j, "adaptiveParallelism", config.adaptiveParallelism);
-  config.adaptiveBias =
-    ReadNumber<float>(j, "adaptiveBias", config.adaptiveBias);
-  config.adaptiveDecayTicks =
-    ReadNumber<uint32_t>(j, "adaptiveDecayTicks", config.adaptiveDecayTicks);
+  config.minOffloadWorkMicros = ReadNumber<uint64_t>(
+    j, "minOffloadWorkMicros", config.minOffloadWorkMicros);
+  config.adaptiveProbeIntervalTicks = ReadNumber<uint32_t>(
+    j, "adaptiveProbeIntervalTicks", config.adaptiveProbeIntervalTicks);
+  config.minOffloadSpeedup =
+    ReadNumber<float>(j, "minOffloadSpeedup", config.minOffloadSpeedup);
+  config.abTrialIntervalTicks = ReadNumber<uint32_t>(
+    j, "abTrialIntervalTicks", config.abTrialIntervalTicks);
+  config.abTrialBlockTicks =
+    ReadNumber<uint32_t>(j, "abTrialBlockTicks", config.abTrialBlockTicks);
+  config.abTrialBlocks =
+    ReadNumber<uint32_t>(j, "abTrialBlocks", config.abTrialBlocks);
   config.adaptiveThrottling =
     ReadBool(j, "adaptiveThrottling", config.adaptiveThrottling);
   config.interestManagement =
@@ -199,16 +248,15 @@ std::string ParallelConfig::Describe() const
   }
   return fmt::format(
     "parallel area offload: enabled, workerThreads={}, "
-    "minActorsToOffload={}, adaptiveParallelism={}, minClusterActors={}, "
-    "minShardActors={}, "
+    "minActorsToOffload={}, adaptiveParallelism={}, minClusterActors={}, minShardActors={}, "
     "minShardMicros={}, spin={}us, separation={} chunks, "
     "interestManagement={} (fullRate={}u, maxSkip={}), "
     "adaptiveThrottling={}, budget={}us",
-    workerThreads, minActorsToOffload, adaptiveParallelism ? "on" : "off",
-    minClusterActors, minShardActors, minShardMicros, workerSpinMicros,
-    clusterSeparationChunks, interestManagement ? "on" : "off",
-    interestFullRateUnits, maxInterestSkipTicks,
-    adaptiveThrottling ? "on" : "off", targetTickBudgetMicros);
+    workerThreads, minActorsToOffload, adaptiveParallelism ? "on" : "off", minClusterActors, minShardActors,
+    minShardMicros, workerSpinMicros, clusterSeparationChunks,
+    interestManagement ? "on" : "off", interestFullRateUnits,
+    maxInterestSkipTicks, adaptiveThrottling ? "on" : "off",
+    targetTickBudgetMicros);
 }
 
 }

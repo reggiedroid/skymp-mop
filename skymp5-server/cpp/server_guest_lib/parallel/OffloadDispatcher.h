@@ -14,43 +14,6 @@
 
 namespace MpParallel {
 
-namespace detail {
-
-// One step of the adaptive offload-threshold control loop, extracted as a
-// pure function.
-//
-// The loop it replaces was written inline in ExecuteTick and keyed on
-// wall-clock timings, which made it untestable on any machine and flaky on a
-// slow one. It shipped default-on and broke `Shard count follows the
-// measured cost` on a 2-core host. Separated out, every rule below is a
-// case in ParallelOffloadTest.cpp rather than a hope.
-struct AdaptiveTickInput
-{
-  // Whether the tick just measured actually used the pool.
-  bool offloaded = false;
-  // Wall clock of the fork/join phase, and the serial-equivalent work it
-  // distributed. The join is excluded from both: both paths pay it.
-  uint64_t parallelMicros = 0;
-  uint64_t aggregateTaskMicros = 0;
-  size_t actorCount = 0;
-  uint64_t tickIndex = 0;
-  // The operator's configured value, which is also the decay floor.
-  size_t configuredThreshold = 0;
-  float bias = 1.05f;
-  uint32_t decayTicks = 10;
-};
-
-struct AdaptiveState
-{
-  size_t threshold = 0;
-  size_t disappointingStreak = 0;
-};
-
-[[nodiscard]] AdaptiveState StepAdaptiveThreshold(AdaptiveState state,
-                                                  const AdaptiveTickInput& in);
-
-}
-
 // Everything ActionListener knows about one movement update, flattened into
 // plain data. The dispatcher copies what it needs, so nothing here has to
 // outlive the call.
@@ -146,6 +109,49 @@ public:
 
   [[nodiscard]] bool IsEnabled() const noexcept { return config.enabled; }
 
+  // Whether this tick's movement is being taken on, asked *before* the caller
+  // goes to the trouble of building a submission.
+  //
+  // Flattening an update is not free -- a dozen floats, the animation flags,
+  // and a cell form id to resolve -- and on a scattered population the gate
+  // declines almost every tick, so building one only to have it handed back is
+  // pure waste. Measured at 100 and 200 spread players, where 99% of ticks
+  // were declined, that waste was 3-4% of the tick.
+  //
+  // Counts the attempt, so it must be called exactly once per movement packet.
+  // The decision itself is taken on the first call of a tick and held.
+  bool WillAcceptThisTick();
+
+  // Whether the caller should time its movement handling this tick and report
+  // it through AddIngestMicros.
+  //
+  // False on the overwhelming majority of ticks. The paired trial needs to
+  // know what a whole tick costs, and neither path keeps all of its cost in
+  // one place -- an accepted tick flattens during ingest and relays in the
+  // join, a declined one relays during ingest and does nothing in the join --
+  // so the ingest half has to be timed by the code that runs it. Doing that
+  // unconditionally would mean two clock reads per movement packet, which at
+  // 400 packets a tick is a few percent of the tick spent measuring. Gating it
+  // on a trial makes it free the rest of the time.
+  [[nodiscard]] bool IsMeasuringThisTick() const noexcept
+  {
+    return measuringThisTick;
+  }
+
+  // Reports time spent handling one movement update during ingest, on
+  // whichever path it took. Only called when IsMeasuringThisTick.
+  //
+  // Nanoseconds, not microseconds. Handling a single update takes well under a
+  // microsecond, so accumulating a microsecond-truncated value summed to
+  // almost exactly zero -- and only on the declined arm, whose whole cost is
+  // here, while the accepted arm's cost is measured once per tick in the join
+  // and escaped the truncation. The trial duly concluded that declining was
+  // twenty-five times cheaper than accepting.
+  void AddIngestNanos(uint64_t nanos) noexcept
+  {
+    ingestNanosThisTick += nanos;
+  }
+
   // Returns false when the update was not taken on, in which case the caller
   // must fall back to handling it inline. That happens when the framework is
   // disabled and on any malformed submission, so a rejection is always safe.
@@ -192,16 +198,6 @@ public:
     return snapshot.tickIndex;
   }
 
-  // The threshold actually in force. Equal to config.minActorsToOffload
-  // unless adaptiveParallelism has raised it, which is a thing an operator
-  // reading the metrics line needs to be able to see. A server behaving
-  // like the feature is off, while the configured value says it should be
-  // on, is otherwise unexplainable from the outside.
-  [[nodiscard]] size_t GetEffectiveMinActorsToOffload() const noexcept
-  {
-    return currentMinActorsToOffload;
-  }
-
 private:
   // A contiguous slice of one cluster's members. The unit of scheduling.
   //
@@ -219,11 +215,8 @@ private:
 
   // allowSharding is false on the inline path, where splitting a cluster
   // would only add per-unit bookkeeping to work that runs serially anyway.
-  void BuildWorkUnits(bool allowSharding);
-  // Raises or decays currentMinActorsToOffload from the tick just measured.
-  // Only called when config.adaptiveParallelism is set.
-  void UpdateAdaptiveThreshold();
-  void RunUnits();
+  void BuildWorkUnits(bool allowSharding = true);
+  void RunUnits(IOffloadSink& sink);
   void JoinResults(IOffloadSink& sink);
   void ResetPool();
   [[nodiscard]] size_t ComputeShardCount(size_t clusterSize,
@@ -238,6 +231,26 @@ private:
   // per-actor cost the previous ticks actually took, so a quiet tick collapses
   // to a single unit and skips the barrier entirely.
   [[nodiscard]] size_t ComputeShardBudget() const;
+
+
+  // Whether this tick's movement should be taken on at all, decided once on
+  // its first packet. False makes every SubmitMovement decline, which sends
+  // ActionListener down the original inline path -- a genuinely different
+  // thing from running the tick without the pool, which still pays for the
+  // snapshot and the deferred join.
+  [[nodiscard]] bool ShouldAcceptThisTick() const;
+
+  // Takes this tick's accept/decline decision if it has not been taken yet,
+  // and primes the pool when the answer is yes.
+  void EnsureTickDecision();
+
+  // Whether this tick is a trial tick, and which arm it belongs to. Called
+  // while taking the tick decision.
+  [[nodiscard]] bool TrialWantsAccept() const noexcept;
+
+  // Folds this tick's measurement into the trial and, when the last block is
+  // done, settles the verdict. Called once per tick after the join.
+  void UpdateTrial();
 
   ParallelConfig config;
   std::unique_ptr<ThreadPool> pool;
@@ -290,22 +303,68 @@ private:
   // Whether the pool has already been told this tick's batch is coming. The
   // hint is worth sending once, on the first submission, which is as early as
   // the fact is known.
-  bool poolPrimed = false;
+  // Whether this tick's accept/decline decision has been taken yet, and what
+  // it was. Taken once on the first submission and held for the whole tick, so
+  // a tick never splits its relays between the deferred and the inline
+  // ordering.
+  bool tickDecisionMade = false;
+  bool acceptingThisTick = true;
+
+  // Actors accepted on the last tick that accepted any. Used to estimate this
+  // tick's work before any of this tick's packets have arrived.
+  size_t lastAcceptedActorCount = 0;
+
+  // Submissions offered this tick and last tick, counted whether or not they
+  // were taken on. This is what lets a shut gate notice a population growing
+  // underneath it -- acceptances alone would freeze the moment it shuts.
+  size_t attemptCountThisTick = 0;
+  size_t lastAttemptCount = 0;
+
+  // Ticks since the last one that accepted work. Drives the probe that stops
+  // the gate latching shut on stale evidence.
+  uint32_t ticksSinceAccept = 0;
+
+  // Smoothed ratio of summed task time to the parallel phase's wall clock,
+  // sampled only on ticks that actually used the pool. Reported for
+  // diagnostics; the accept/decline decision is made by the paired trial
+  // below, which measures the thing being decided instead of a proxy for it.
+  double achievedSpeedupEma = 0.0;
+
+  // --- paired A/B trial --------------------------------------------------
+  //
+  // The decision procedure. Rather than compare a statistic against a
+  // threshold, run both paths in short alternating blocks and keep whichever
+  // measured cheaper per mover.
+
+  // Where the trial is up to. Ticks counted only while movement is arriving,
+  // so an idle server neither trials nor ages its verdict.
+  uint32_t ticksSinceTrial = 0;
+  uint32_t trialTicksDone = 0;
+  bool trialInProgress = false;
+
+  // Whether this tick is measured, and what it accumulated.
+  bool measuringThisTick = false;
+  uint64_t ingestNanosThisTick = 0;
+
+  // Per-mover cost summed over each arm of the current trial, and how many
+  // ticks contributed to each.
+  double trialAcceptCostPerMover = 0.0;
+  double trialDeclineCostPerMover = 0.0;
+  uint32_t trialAcceptTicks = 0;
+  uint32_t trialDeclineTicks = 0;
+
+  // The standing verdict. True until a trial says otherwise, because the
+  // asymmetry favours engaging: the cost of taking work on that did not need
+  // it is a few percent, and the cost of missing a real crowd is half the
+  // tick.
+  bool abVerdictAccept = true;
+  bool abHasVerdict = false;
 
   // How many tasks the previous tick pooled, used as the size hint for the
   // prime. Starts at 0 so the very first tick primes nothing and simply pays
   // the wakeup.
   size_t lastPooledUnitEstimate = 0;
 
-  // The offload threshold actually in force. Equal to
-  // config.minActorsToOffload unless adaptiveParallelism has raised it; it
-  // never decays below that value, so the controller can only ever be more
-  // conservative than the operator asked for.
-  size_t currentMinActorsToOffload = 0;
-
-  // How many ticks in a row the offload has failed the adaptiveBias test.
-  // Reset by any tick that passes it, and by a tick that did not offload.
-  size_t consecutiveDisappointingTicks = 0;
 };
 
 }

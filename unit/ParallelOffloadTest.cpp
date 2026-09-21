@@ -5,6 +5,7 @@
 #include <catch2/catch_all.hpp>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 using namespace MpParallel;
@@ -54,6 +55,7 @@ public:
                       const uint8_t* packetBytes,
                       size_t packetBytesLength) override
   {
+    std::lock_guard<std::mutex> lock(relayMtx);
     for (size_t i = 0; i < count; ++i) {
       const OutboundSend& send = sends[i];
       if (send.byteLength == 0 ||
@@ -73,6 +75,9 @@ public:
   std::vector<uint32_t> applied;
   std::vector<uint32_t> corrected;
   std::vector<RecordedRelay> relays;
+  // Guarded because the dispatcher relays from worker threads: SendRelayBatch
+  // is the one sink call that is not made on the joining thread.
+  std::mutex relayMtx;
   std::map<uint32_t, std::array<float, 3>> appliedPos;
 };
 
@@ -87,6 +92,18 @@ ParallelConfig MakeConfig(size_t workerThreads, size_t minActorsToOffload)
   // fan-out. Interest management gets its own dedicated cases below.
   config.adaptiveThrottling = false;
   config.interestManagement = false;
+  // These cases exercise the dispatcher's machinery -- partitioning,
+  // sharding, the join order -- on populations of a few dozen actors. That is
+  // well below where taking the work on pays for itself, so with the default
+  // policy the dispatcher would correctly decline all of it and the machinery
+  // under test would never run. 0 disables the gate; the policy itself is
+  // covered by its own cases.
+  config.minOffloadWorkMicros = 0;
+  // And the speedup gate, for the same reason. A few dozen actors across two
+  // worker threads will not reach 1.5x, so with the shipped policy the
+  // dispatcher would rightly decline every one of these and the machinery
+  // under test would never run.
+  config.minOffloadSpeedup = 0.f;
   config.Normalize();
   return config;
 }
@@ -402,9 +419,30 @@ TEST_CASE("Throttling only fires under pressure and spares close players",
   SECTION("Under pressure, nearby players are still never throttled")
   {
     REQUIRE(InterestManager::ComputeSkipFactor(0.f, 3, config) == 1);
-    // Exactly at the threshold distance.
-    REQUIRE(InterestManager::ComputeSkipFactor(4096.f * 4096.f, 3, config) ==
+
+    // At pressure 1 the exemption is half the configured radius, so someone
+    // just inside 2048 is still spared.
+    REQUIRE(InterestManager::ComputeSkipFactor(2000.f * 2000.f, 1, config) ==
             1);
+
+    // At the highest pressure it has shrunk to an eighth -- 512 units, which
+    // is still inside a fight.
+    REQUIRE(InterestManager::ComputeSkipFactor(500.f * 500.f, 3, config) == 1);
+  }
+
+  SECTION("The exemption shrinks as pressure rises")
+  {
+    // This is the fix for a mechanism that was dead on arrival. Held fixed at
+    // the configured radius -- 4096, one whole chunk -- the exemption covered
+    // every pair in a crowd that had packed into a single chunk, which is the
+    // only situation the throttle exists for. Measured on 300 players walking
+    // into one square, it suppressed exactly zero edges at every budget tried.
+    //
+    // So a player 4096 units away is spared at low pressure and spaced out at
+    // high pressure, rather than being spared unconditionally.
+    const float sqrAtRadius = 4000.f * 4000.f;
+    REQUIRE(InterestManager::ComputeSkipFactor(sqrAtRadius, 0, config) == 1);
+    REQUIRE(InterestManager::ComputeSkipFactor(sqrAtRadius, 3, config) > 1);
   }
 
   SECTION("Distant players are spaced out, more so the further they are")
@@ -801,14 +839,13 @@ TEST_CASE("Sharding is behaviour-neutral under the work-based budget",
                                  0xff000000 + i, 20.f * i, 0.f));
   }
 
-  auto run = [&](uint32_t minShardMicros) {
+  auto run = [&](uint32_t minShardMicros, RecordingSink& sink) {
     ParallelConfig config = MakeConfig(4, 1);
     config.minShardActors = 1;
     config.minShardMicros = minShardMicros;
     config.Normalize();
 
     OffloadDispatcher dispatcher(config);
-    RecordingSink sink;
     for (int tick = 0; tick < 3; ++tick) {
       sink.relays.clear();
       sink.applied.clear();
@@ -821,14 +858,21 @@ TEST_CASE("Sharding is behaviour-neutral under the work-based budget",
       dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
       dispatcher.ExecuteTick(sink);
     }
-    return sink;
   };
 
-  const RecordingSink fine = run(1);
-  const RecordingSink coarse = run(1000000);
+  RecordingSink fine;
+  RecordingSink coarse;
+  run(1, fine);
+  run(1000000, coarse);
 
   REQUIRE(fine.applied == coarse.applied);
   REQUIRE(fine.relays.size() == coarse.relays.size());
+  // Compared as a set, not a sequence. Relays now leave on whichever worker
+  // owns the shard, so the order two shard sizes emit them in is a scheduling
+  // artefact. What has to match is which bytes each user got, which is the
+  // same contract `Parallel and inline runs produce the same work` states.
+  std::sort(fine.relays.begin(), fine.relays.end());
+  std::sort(coarse.relays.begin(), coarse.relays.end());
   for (size_t i = 0; i < fine.relays.size(); ++i) {
     REQUIRE(fine.relays[i].userId == coarse.relays[i].userId);
     REQUIRE(fine.relays[i].bytes == coarse.relays[i].bytes);
@@ -880,4 +924,277 @@ TEST_CASE("An inline tick does not charge a real area for the whole server",
 
   REQUIRE(dispatcher.GetMetrics().totalInlineTicks == 40);
   REQUIRE(dispatcher.GetMetrics().totalRelayEdgesThrottled == 0);
+}
+
+namespace {
+
+// Drives `ticks` ticks with `actorCount` movers all in one chunk.
+void DriveTicks(OffloadDispatcher& dispatcher, RecordingSink& sink,
+                int actorCount, int ticks, const std::vector<uint8_t>& packet,
+                const std::vector<RelayTarget>& targets)
+{
+  for (int t = 0; t < ticks; ++t) {
+    for (int i = 0; i < actorCount; ++i) {
+      dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                       packet));
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+}
+
+std::vector<RelayTarget> MakeTargets(int count)
+{
+  std::vector<RelayTarget> targets;
+  for (int i = 0; i < count; ++i) {
+    targets.push_back(MakeTarget(static_cast<Networking::UserId>(i),
+                                 0xff000000 + i, 10.f * i, 0.f));
+  }
+  return targets;
+}
+
+ParallelConfig MakeAdaptive(size_t workerThreads, size_t minActorsToOffload)
+{
+  ParallelConfig config = MakeConfig(workerThreads, minActorsToOffload);
+  config.adaptiveParallelism = true;
+  config.Normalize();
+  return config;
+}
+
+}
+
+TEST_CASE("Adaptive tuning never changes what gets relayed",
+          "[ParallelOffload]")
+{
+  // The trial may move work between the pool and the calling thread. It may
+  // not move a single packet. Same population, same targets, trial on and
+  // off: byte-identical relays to byte-identical users.
+  //
+  // This used to compare the two sequences position by position. It cannot
+  // any more: relays are emitted by the worker that owns the shard, so their
+  // order within a tick is a scheduling artefact and differs run to run. The
+  // guarantee that survives is the one that matters to a player -- the set of
+  // packets delivered is unchanged -- and it is the same contract
+  // `Parallel and inline runs produce the same work` already states.
+  const std::vector<uint8_t> packet{ 3, 1, 4, 1, 5 };
+  const std::vector<RelayTarget> targets = MakeTargets(50);
+
+  auto run = [&](bool adaptive, RecordingSink& sink) {
+    ParallelConfig config = MakeConfig(3, 1);
+    config.adaptiveParallelism = adaptive;
+    config.Normalize();
+
+    OffloadDispatcher dispatcher(config);
+    DriveTicks(dispatcher, sink, 50, 25, packet, targets);
+  };
+
+  RecordingSink fixed;
+  RecordingSink adaptive;
+  run(false, fixed);
+  run(true, adaptive);
+
+  REQUIRE(fixed.relays.size() == adaptive.relays.size());
+  REQUIRE(fixed.applied == adaptive.applied);
+  std::sort(fixed.relays.begin(), fixed.relays.end());
+  std::sort(adaptive.relays.begin(), adaptive.relays.end());
+  for (size_t i = 0; i < fixed.relays.size(); ++i) {
+    REQUIRE(fixed.relays[i].userId == adaptive.relays[i].userId);
+    REQUIRE(fixed.relays[i].bytes == adaptive.relays[i].bytes);
+  }
+}
+
+TEST_CASE("Adaptive tuning off reproduces the fixed threshold exactly",
+          "[ParallelOffload]")
+{
+  // The escape hatch has to be real: with the controller disabled, the
+  // threshold must be whatever the operator configured, forever.
+  ParallelConfig config = MakeConfig(2, 45);
+  config.adaptiveParallelism = false;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 7 };
+  const std::vector<RelayTarget> targets = MakeTargets(40);
+
+  // 40 movers, threshold 45: never offloads, and no amount of ticking may
+  // decay it into offloading.
+  DriveTicks(dispatcher, sink, 40, 50, packet, targets);
+
+  REQUIRE(dispatcher.GetMetrics().totalOffloadedTicks == 0);
+  REQUIRE(dispatcher.GetMetrics().totalInlineTicks == 50);
+}
+
+TEST_CASE("A scattered population is declined, not merely un-pooled",
+          "[ParallelOffload]")
+{
+  // The distinction this asserts is the whole reason ShouldAcceptThisTick
+  // exists. Skipping only the thread pool still flattens every packet into the
+  // snapshot and still defers relays to the join, so the server pays for the
+  // split and gets nothing back -- measured at 250 players, 577us against an
+  // inline 482us. Declining instead hands the update back to ActionListener,
+  // which runs the original path.
+  //
+  // Observable difference: a declined tick submits nothing, so the dispatcher
+  // has no pending work and emits no relays of its own.
+  ParallelConfig config = MakeConfig(2, 1);
+  // Far above anything this population can estimate, so the gate must decline.
+  config.minOffloadWorkMicros = 100000;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 1, 2, 3 };
+  const std::vector<RelayTarget> targets = MakeTargets(30);
+
+  // First tick has no measurement yet, so it is accepted -- the asymmetry says
+  // guess toward engaging. That tick supplies the estimate the gate then uses.
+  DriveTicks(dispatcher, sink, 30, 1, packet, targets);
+  REQUIRE(dispatcher.GetMetrics().lastActorCount == 30);
+
+  // Subsequent ticks must be declined outright.
+  for (int tick = 0; tick < 5; ++tick) {
+    for (int i = 0; i < 30; ++i) {
+      const bool accepted = dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                       packet));
+      REQUIRE_FALSE(accepted);
+    }
+    REQUIRE(dispatcher.GetPendingCount() == 0);
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+}
+
+TEST_CASE("A work gate of zero never declines", "[ParallelOffload]")
+{
+  // The documented escape hatch for an operator who wants the offloaded path
+  // unconditionally -- typically because they want interest management, which
+  // only exists there.
+  ParallelConfig config = MakeConfig(2, 1);
+  config.minOffloadWorkMicros = 0;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 4, 5 };
+  const std::vector<RelayTarget> targets = MakeTargets(20);
+
+  for (int tick = 0; tick < 20; ++tick) {
+    for (int i = 0; i < 20; ++i) {
+      REQUIRE(dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                       packet)));
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+
+  REQUIRE(dispatcher.GetMetrics().lastRelayEdgesEmitted == 20 * 20);
+}
+
+TEST_CASE("The speedup gate declines when the pool is not paying off",
+          "[ParallelOffload]")
+{
+  // Deterministic stand-in for the condition this gate exists to catch: a
+  // machine where the pool cannot achieve much, either because there is too
+  // little work or because the cores are busy with something else. Rather
+  // than try to manufacture contention, the threshold is set past anything
+  // achievable, which puts the gate in exactly the state a contended host
+  // would.
+  ParallelConfig config = MakeConfig(2, 1);
+  config.minOffloadWorkMicros = 0;
+  config.minOffloadSpeedup = 1000.f;
+  // Keep the probe out of it; its own behaviour is covered separately.
+  config.adaptiveProbeIntervalTicks = 0;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 1, 2, 3 };
+  const std::vector<RelayTarget> targets = MakeTargets(40);
+
+  // Warm up: the first ticks have no speedup measurement yet and are accepted,
+  // which is what supplies one.
+  DriveTicks(dispatcher, sink, 40, 6, packet, targets);
+
+  // From here the measured speedup cannot possibly clear the bar, so movement
+  // must be handed back to the inline path rather than merely un-pooled.
+  bool sawDecline = false;
+  for (int tick = 0; tick < 10; ++tick) {
+    const bool accepted = dispatcher.SubmitMovement(
+      MakeSubmission(0xff000000, 0, 0, 0.f, 0.f, packet));
+    if (!accepted) {
+      sawDecline = true;
+      REQUIRE(dispatcher.GetPendingCount() == 0);
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+  REQUIRE(sawDecline);
+}
+
+TEST_CASE("A speedup gate of zero never declines", "[ParallelOffload]")
+{
+  // The documented way to switch the test off, for an operator who has
+  // measured their own hardware and disagrees with it.
+  ParallelConfig config = MakeConfig(2, 1);
+  config.minOffloadWorkMicros = 0;
+  config.minOffloadSpeedup = 0.f;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 7, 7 };
+  const std::vector<RelayTarget> targets = MakeTargets(25);
+
+  for (int tick = 0; tick < 25; ++tick) {
+    for (int i = 0; i < 25; ++i) {
+      REQUIRE(dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                       packet)));
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+  REQUIRE(dispatcher.GetMetrics().lastRelayEdgesEmitted == 25 * 25);
+}
+
+TEST_CASE("Speedup is measured only from ticks that used the pool",
+          "[ParallelOffload]")
+{
+  // A tick that ran everything on the calling thread has a speedup of 1 by
+  // construction. Folding those samples in would drag the estimate under the
+  // threshold and hold it there, so the gate would conclude the pool does not
+  // work from evidence gathered without it -- a latch dressed up as a
+  // measurement.
+  ParallelConfig config = MakeConfig(2, 10000);  // never engages the pool
+  config.minOffloadWorkMicros = 0;
+  config.minOffloadSpeedup = 1.5f;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 2, 4 };
+  const std::vector<RelayTarget> targets = MakeTargets(30);
+
+  DriveTicks(dispatcher, sink, 30, 30, packet, targets);
+
+  // Every tick ran on the calling thread, so no speedup sample was ever
+  // legitimately taken and the gate must not have formed a verdict from them.
+  REQUIRE(dispatcher.GetMetrics().totalOffloadedTicks == 0);
+  REQUIRE(dispatcher.GetMetrics().lastAchievedSpeedup == 0.0);
+  // And the work is still being done, on the inline path.
+  REQUIRE(dispatcher.GetMetrics().lastRelayEdgesEmitted == 30 * 30);
 }

@@ -37,8 +37,36 @@ struct ParallelMetrics
   // gives the achieved speedup, which is the number worth watching.
   uint64_t lastAggregateTaskMicros = 0;
 
+
+  // Submissions offered last tick, accepted or not. Against lastActorCount
+  // this shows whether the gate is declining and by how much.
+  size_t lastAttemptCount = 0;
+
+  // Smoothed parallel speedup the gate is deciding on. Below
+  // minOffloadSpeedup the pool is not repaying what the offloaded path costs,
+  // and movement is handed back to the inline path.
+  double lastAchievedSpeedup = 0.0;
+
+  // What the last paired trial measured, in microseconds per mover, for each
+  // path -- and which one it kept. These two numbers are the whole decision,
+  // so an operator wondering why the offload is or is not engaging should look
+  // here first.
+  double lastTrialAcceptMicrosPerMover = 0.0;
+  double lastTrialDeclineMicrosPerMover = 0.0;
+  bool lastTrialAccepted = true;
+
   // --- running totals ---------------------------------------------------
   uint64_t totalTicks = 0;
+
+
+  // Ticks whose movement was declined outright, sending ActionListener down
+  // the original inline path. Expected to be most of them on a quiet server
+  // and near none during a crowd.
+  uint64_t totalDeclinedTicks = 0;
+
+  // Paired trials completed. One every abTrialIntervalTicks while movement is
+  // arriving; a flat zero on a busy server means the trial is not running.
+  uint64_t totalTrials = 0;
   uint64_t totalOffloadedTicks = 0;
   uint64_t totalInlineTicks = 0;
   uint64_t totalRelayEdgesEmitted = 0;

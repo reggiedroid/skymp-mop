@@ -31,13 +31,6 @@ constexpr uint64_t kEvictIntervalTicks = 4096;
 // wrong rather than that the server is busy.
 constexpr size_t kMaxPendingSubmissions = 200000;
 
-// Consecutive ticks the offload must disappoint before the adaptive
-// controller raises the threshold. One tick is a scheduling hiccup: a GC
-// pause on the Node thread, or another process taking a core for a
-// millisecond. Raising on one of those would suspend the pool for the whole
-// decay window, which is the expensive half of an asymmetric penalty.
-constexpr size_t kAdaptiveBackoffTicks = 3;
-
 // Weight of the newest sample in the per-actor cost estimate. Low enough that
 // one tick which collided with a GC pause does not resize every shard, high
 // enough to follow a crowd forming over a couple of seconds.
@@ -49,7 +42,6 @@ OffloadDispatcher::OffloadDispatcher(const ParallelConfig& config_)
   : config(config_)
 {
   config.Normalize();
-  currentMinActorsToOffload = config.minActorsToOffload;
   ResetPool();
 }
 
@@ -83,8 +75,6 @@ void OffloadDispatcher::Reconfigure(const ParallelConfig& newConfig)
   // size the first shards after a reconfigure from measurements of a
   // different configuration.
   microsPerActorEma = 0.0;
-  currentMinActorsToOffload = config.minActorsToOffload;
-  consecutiveDisappointingTicks = 0;
   ResetPool();
 }
 
@@ -93,7 +83,8 @@ void OffloadDispatcher::DiscardPending() noexcept
   snapshot.Clear();
   clusters.clear();
   workUnits.clear();
-  poolPrimed = false;
+  tickDecisionMade = false;
+  acceptingThisTick = true;
   for (ClusterOutput& output : unitOutputs) {
     output.Reset();
   }
@@ -119,20 +110,13 @@ bool OffloadDispatcher::SubmitMovement(const MovementSubmission& submission)
     return false;
   }
 
-  // First packet of the tick: tell the workers a batch is coming. The rest of
-  // ingest then runs while they wake, so by the time ExecuteTick publishes the
-  // batch they are already spinning on it. That wakeup used to sit on the
-  // critical path and was most of what made the offload lose below a few
-  // hundred players.
-  //
-  // The size of the batch is not known yet -- the packets are still arriving
-  // -- so the previous tick's is the estimate. Population moves slowly
-  // relative to a tick, and being wrong only costs a spin or a wakeup.
-  if (!poolPrimed) {
-    poolPrimed = true;
-    if (pool) {
-      pool->Prime(lastPooledUnitEstimate);
-    }
+  // Normally already decided, because the caller asked WillAcceptThisTick
+  // before building the submission. Decided here too so a direct caller -- the
+  // dispatcher's own tests -- still behaves.
+  EnsureTickDecision();
+
+  if (!acceptingThisTick) {
+    return false;
   }
 
   ActorSnapshot actor;
@@ -232,21 +216,47 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   metrics.ResetTick();
   metrics.lastTickIndex = snapshot.tickIndex;
   ++metrics.totalTicks;
-  poolPrimed = false;
+
+  // Only the "has a decision been taken" flag is cleared here. The decision
+  // itself has to survive into UpdateTrial below, which runs at the end of
+  // this tick and needs to know which arm the tick belonged to. Resetting it
+  // here made every trial tick look like an accept, so the decline arm never
+  // gathered a sample and no trial ever reached a verdict. EnsureTickDecision
+  // always assigns it before anything reads it as a decision.
+  tickDecisionMade = false;
+
+  // Rolled over before the early return below, because a tick that declined
+  // everything leaves the snapshot empty and that is precisely the tick whose
+  // attempt count the gate needs.
+  lastAttemptCount = attemptCountThisTick;
+  attemptCountThisTick = 0;
+  metrics.lastAttemptCount = lastAttemptCount;
 
   if (snapshot.Empty()) {
+    // A tick with nothing in it is not evidence the gate is right, so the
+    // probe clock keeps running.
+    if (lastAttemptCount > 0) {
+      ++ticksSinceAccept;
+    }
+    ++metrics.totalDeclinedTicks;
+    // A declined tick is one arm of the trial, so it has to be folded in
+    // before the early return -- otherwise only accepted ticks would ever be
+    // measured and the comparison would have nothing to compare against.
+    UpdateTrial();
+    metrics.lastAttemptCount = lastAttemptCount;
     snapshot.Clear();
     return;
   }
 
+  ticksSinceAccept = 0;
   metrics.lastActorCount = snapshot.actors.size();
+  // Only ticks that accepted tell us anything about what a tick costs.
+  lastAcceptedActorCount = snapshot.actors.size();
 
-  RunUnits();
+  RunUnits(sink);
   JoinResults(sink);
 
-  if (config.adaptiveParallelism) {
-    UpdateAdaptiveThreshold();
-  }
+  UpdateTrial();
 
   if (pool) {
     const uint64_t failed = pool->GetFailedTaskCount();
@@ -274,6 +284,226 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   }
 
   snapshot.Clear();
+}
+
+bool OffloadDispatcher::TrialWantsAccept() const noexcept
+{
+  // Blocks of abTrialBlockTicks, alternating. Block 0 accepts, block 1
+  // declines, and so on, so the two arms are interleaved through the same
+  // stretch of wall clock and see the same population.
+  const uint32_t block = trialTicksDone / std::max<uint32_t>(
+                                            config.abTrialBlockTicks, 1);
+  return (block % 2) == 0;
+}
+
+void OffloadDispatcher::EnsureTickDecision()
+{
+  if (tickDecisionMade) {
+    return;
+  }
+  tickDecisionMade = true;
+
+  if (trialInProgress) {
+    // Mid-trial: the arm decides, not the policy. Measuring is on so both
+    // halves of the tick's cost are captured.
+    acceptingThisTick = TrialWantsAccept();
+    measuringThisTick = true;
+  } else {
+    acceptingThisTick = ShouldAcceptThisTick();
+    measuringThisTick = false;
+  }
+  ingestNanosThisTick = 0;
+
+  // First packet of the tick: tell the workers a batch is coming. The rest of
+  // ingest then runs while they wake, so by the time ExecuteTick publishes the
+  // batch they are already spinning on it. That wakeup used to sit on the
+  // critical path and was most of what made the offload lose below a few
+  // hundred players.
+  //
+  // The size of the batch is not known yet -- the packets are still arriving
+  // -- so the previous tick's is the estimate. Population moves slowly
+  // relative to a tick, and being wrong only costs a spin or a wakeup.
+  if (acceptingThisTick && pool) {
+    pool->Prime(lastPooledUnitEstimate);
+  }
+}
+
+bool OffloadDispatcher::WillAcceptThisTick()
+{
+  if (!config.enabled) {
+    return false;
+  }
+  EnsureTickDecision();
+
+  // Counted whether or not the tick is taken on: a declined tick still reveals
+  // how many players are trying to move, which is what lets the gate notice a
+  // growing population without having to accept work to find out.
+  ++attemptCountThisTick;
+
+  return acceptingThisTick;
+}
+
+bool OffloadDispatcher::ShouldAcceptThisTick() const
+{
+  // Declining is not the same as "run the tick without the pool", and the
+  // difference is the whole point of this function.
+  //
+  // Skipping only the pool still flattens every packet into the snapshot and
+  // still defers relays to the join, so the server pays for the split without
+  // getting the parallelism. Measured, that is *worse* than never enabling the
+  // feature: 577us against an inline 482us at 250 players. Declining instead
+  // makes ActionListener take the original relay-then-validate path verbatim,
+  // which is the real floor.
+  //
+  // On a scattered population -- which is what a live server looks like most
+  // of the time, as opposed to the packed crowd the offload exists for -- this
+  // is worth about 10% of the tick at 300 players, and no amount of tuning the
+  // pool could have recovered it.
+  if (!config.enabled) {
+    return false;
+  }
+
+  // Declining also gives up interest management, which only exists on the
+  // offloaded path. That sounds like it should make this decision a trade-off,
+  // and it turns out not to be much of one: the work estimate is low exactly
+  // when the population is scattered, and a scattered population is precisely
+  // where interest management has least to do -- it sheds relays to *distant*
+  // recipients, and a player alone in the woods has no distant recipients to
+  // shed. The two line up rather than fight.
+  //
+  // An operator who wants interest management unconditionally can set
+  // minOffloadWorkMicros to 0, which never declines.
+
+  // No measurement yet: accept. The asymmetry is well established -- engaging
+  // when we should not costs a few percent, failing to engage on a real crowd
+  // costs more than half the tick.
+  if (microsPerActorEma <= 0.0) {
+    return true;
+  }
+
+  // The gate has been shut long enough that its evidence is stale. Take one
+  // tick on to refresh it. Everything the decision rests on is measured only
+  // on accepted ticks, so without this the gate cannot notice the world
+  // changing under it.
+  if (config.adaptiveProbeIntervalTicks > 0 &&
+      ticksSinceAccept >= config.adaptiveProbeIntervalTicks) {
+    return true;
+  }
+
+  // Attempts, not acceptances. A declined tick still tells us how many players
+  // tried to move, and that is the half of the estimate which tracks a raid
+  // forming. The other half -- what an actor costs, which rises as a crowd
+  // packs together -- only a probe can refresh.
+  const size_t actors =
+    lastAttemptCount > 0 ? lastAttemptCount : lastAcceptedActorCount;
+  if (actors == 0) {
+    return true;
+  }
+
+  // A materially bigger population than the one the last verdict was formed
+  // on. Do not wait out the probe interval for that -- the routine probe is
+  // sized for density creeping up, and this is the fast case it would miss.
+  if (lastAcceptedActorCount > 0 &&
+      actors >= lastAcceptedActorCount + lastAcceptedActorCount / 2) {
+    return true;
+  }
+
+  const double estimatedWork =
+    microsPerActorEma * static_cast<double>(actors);
+  if (estimatedWork < static_cast<double>(config.minOffloadWorkMicros)) {
+    return false;
+  }
+
+  // The verdict from the last paired trial, which measured both paths against
+  // this population rather than inferring from a proxy. Everything above is a
+  // cheap early-out for cases too small to be worth trialling.
+  if (config.adaptiveParallelism && abHasVerdict) {
+    return abVerdictAccept;
+  }
+
+  // No trial has completed yet. Fall back to the speedup proxy, which is what
+  // decided before the trial existed and is still a reasonable first guess.
+  if (config.minOffloadSpeedup > 0.f && achievedSpeedupEma > 0.0) {
+    return achievedSpeedupEma >=
+      static_cast<double>(config.minOffloadSpeedup);
+  }
+  return true;
+}
+
+void OffloadDispatcher::UpdateTrial()
+{
+  if (!config.adaptiveParallelism) {
+    return;
+  }
+
+  // An idle tick is not evidence about either path, and counting it would let
+  // a quiet night age out a verdict that is still perfectly good.
+  if (lastAttemptCount == 0) {
+    return;
+  }
+
+  const uint32_t blockTicks = std::max<uint32_t>(config.abTrialBlockTicks, 1);
+  const uint32_t trialLength =
+    blockTicks * std::max<uint32_t>(config.abTrialBlocks, 2);
+
+  if (!trialInProgress) {
+    if (++ticksSinceTrial < config.abTrialIntervalTicks && abHasVerdict) {
+      return;
+    }
+    // Start one.
+    ticksSinceTrial = 0;
+    trialInProgress = true;
+    trialTicksDone = 0;
+    trialAcceptCostPerMover = 0.0;
+    trialDeclineCostPerMover = 0.0;
+    trialAcceptTicks = 0;
+    trialDeclineTicks = 0;
+    return;
+  }
+
+  // Mid-trial. What this tick cost, end to end, per mover.
+  //
+  // Both halves are needed and they live in different places on the two paths:
+  // an accepted tick flattens updates during ingest and does its relays in the
+  // join, while a declined one does everything during ingest. Adding the
+  // dispatcher's own phases to the ingest time the caller reported is what
+  // makes the two comparable.
+  const double tickMicros = static_cast<double>(ingestNanosThisTick) / 1000.0 +
+    static_cast<double>(metrics.lastParallelMicros + metrics.lastJoinMicros);
+  const double cost = tickMicros / static_cast<double>(lastAttemptCount);
+
+  if (acceptingThisTick) {
+    trialAcceptCostPerMover += cost;
+    ++trialAcceptTicks;
+  } else {
+    trialDeclineCostPerMover += cost;
+    ++trialDeclineTicks;
+  }
+
+  if (++trialTicksDone < trialLength) {
+    return;
+  }
+
+  trialInProgress = false;
+  measuringThisTick = false;
+
+  if (trialAcceptTicks == 0 || trialDeclineTicks == 0) {
+    return;
+  }
+
+  const double accept = trialAcceptCostPerMover / trialAcceptTicks;
+  const double decline = trialDeclineCostPerMover / trialDeclineTicks;
+
+  // Ties, and near-ties, go to accepting. The asymmetry has been measured
+  // repeatedly: taking work on that did not need it costs a few percent, and
+  // missing a real crowd costs half the tick.
+  abVerdictAccept = accept <= decline * 1.02;
+  abHasVerdict = true;
+
+  metrics.lastTrialAcceptMicrosPerMover = accept;
+  metrics.lastTrialDeclineMicrosPerMover = decline;
+  metrics.lastTrialAccepted = abVerdictAccept;
+  ++metrics.totalTrials;
 }
 
 size_t OffloadDispatcher::ComputeShardBudget() const
@@ -359,92 +589,31 @@ void OffloadDispatcher::BuildWorkUnits(bool allowSharding)
   }
 }
 
-namespace detail {
-
-AdaptiveState StepAdaptiveThreshold(AdaptiveState state,
-                                    const AdaptiveTickInput& in)
-{
-  const size_t floor = in.configuredThreshold;
-
-  if (in.offloaded) {
-    // Compare like with like. The join is paid by both paths (the
-    // sequential path runs the same units on the calling thread and then
-    // joins them identically), so charging it to the offload makes a tick
-    // look bad at exactly the populations where the offload is winning. What
-    // the offload is answerable for is its fork/join phase against the work
-    // it distributed, which is ParallelMetrics::GetLastSpeedup inverted.
-    const double tolerated = static_cast<double>(in.aggregateTaskMicros) *
-      static_cast<double>(in.bias);
-    const bool disappointing =
-      static_cast<double>(in.parallelMicros) > tolerated;
-
-    if (!disappointing) {
-      state.disappointingStreak = 0;
-      return state;
-    }
-
-    // One bad tick is a scheduling hiccup, not a verdict. Raising is the
-    // expensive direction: `Cost of a wrong offload threshold` measured a
-    // too-high threshold at up to 2.2x, and worse than leaving the feature
-    // off entirely, against 4% for a too-low one. So it takes several ticks
-    // in a row, and it stops just above the population that disappointed
-    // rather than overshooting past it.
-    if (++state.disappointingStreak < kAdaptiveBackoffTicks) {
-      return state;
-    }
-    state.disappointingStreak = 0;
-    state.threshold = std::max(floor, in.actorCount + 1);
-    return state;
-  }
-
-  state.disappointingStreak = 0;
-
-  // Decaying is the cheap direction, so it does not crawl. Stepping down by
-  // one every ten ticks would take roughly a minute at 60Hz to walk a
-  // 400-player back-off down to the configured value, and every tick of that
-  // minute pays the snapshot split without the parallelism that justifies it.
-  if (state.threshold <= floor) {
-    state.threshold = floor;
-    return state;
-  }
-  if (in.decayTicks == 0 || in.tickIndex % in.decayTicks != 0) {
-    return state;
-  }
-  const size_t excess = state.threshold - floor;
-  state.threshold -= std::max<size_t>(excess / 2, 1);
-  return state;
-}
-
-}
-
-void OffloadDispatcher::UpdateAdaptiveThreshold()
-{
-  detail::AdaptiveTickInput in;
-  in.offloaded = lastTickOffloaded;
-  in.parallelMicros = metrics.lastParallelMicros;
-  in.aggregateTaskMicros = metrics.lastAggregateTaskMicros;
-  in.actorCount = snapshot.actors.size();
-  in.tickIndex = snapshot.tickIndex;
-  in.configuredThreshold = config.minActorsToOffload;
-  in.bias = config.adaptiveBias;
-  in.decayTicks = config.adaptiveDecayTicks;
-
-  detail::AdaptiveState state;
-  state.threshold = currentMinActorsToOffload;
-  state.disappointingStreak = consecutiveDisappointingTicks;
-
-  state = detail::StepAdaptiveThreshold(state, in);
-
-  currentMinActorsToOffload = state.threshold;
-  consecutiveDisappointingTicks = state.disappointingStreak;
-}
-
-void OffloadDispatcher::RunUnits()
+void OffloadDispatcher::RunUnits(IOffloadSink& sink)
 {
   const uint64_t parallelStart = NowMicros();
 
-  const bool offload = pool && pool->GetWorkerCount() > 0 &&
-    snapshot.actors.size() >= currentMinActorsToOffload;
+  // Two gates, and the second is the one that usually decides.
+  //
+  // Head count is only a floor. What settles whether the pool pays is how much
+  // parallel work there is, which depends on how densely the population is
+  // packed rather than on how large it is -- the relay term is quadratic in
+  // how many players can see each other. The work estimate is the same one the
+  // shard budget uses, so a scattered population produces a small number here
+  // and a crowd a large one, with no extra measurement.
+  //
+  // Before the first measurement the estimate is unavailable, and the
+  // asymmetry says which way to guess: engaging when we should not costs a few
+  // percent, while failing to engage on a real crowd costs more than half the
+  // tick. So an unwarmed estimate offloads.
+  const bool enoughActors =
+    snapshot.actors.size() >= config.minActorsToOffload;
+  const bool enoughWork = microsPerActorEma <= 0.0 ||
+    microsPerActorEma * static_cast<double>(snapshot.actors.size()) >=
+      static_cast<double>(config.minOffloadWorkMicros);
+
+  const bool offload =
+    pool && pool->GetWorkerCount() > 0 && enoughActors && enoughWork;
   lastTickOffloaded = offload;
 
   if (offload) {
@@ -511,16 +680,20 @@ void OffloadDispatcher::RunUnits()
         snapshot, clusters[unit.clusterIndex].actorIndices.data() + unit.begin,
         unit.count, pressureByCluster[unit.clusterIndex], policy,
         unitOutputs[unitIndex]);
+      const ClusterOutput& output = unitOutputs[unitIndex];
+      if (!output.sends.empty()) {
+        sink.SendRelayBatch(output.sends.data(), output.sends.size(),
+                            snapshot.rawPacketBytes.data(),
+                            snapshot.rawPacketBytes.size());
+      }
       unitOutputs[unitIndex].elapsedMicros = NowMicros() - taskStart;
     }
     // lastAggregateTaskMicros is accumulated by JoinResults, which walks the
     // same outputs; adding it here too would double count.
     metrics.lastParallelMicros = NowMicros() - parallelStart;
-    return;
-  }
-
-  // Longest cluster first so the biggest pieces enter the queue before the
-  // scraps. The pool hands tasks out dynamically from there.
+  } else {
+    // Longest cluster first so the biggest pieces enter the queue before the
+    // scraps. The pool hands tasks out dynamically from there.
   loadBalancer.BuildSchedule(clusters, schedule);
 
   clusterRank.assign(clusters.size(), 0);
@@ -560,13 +733,19 @@ void OffloadDispatcher::RunUnits()
       continue;
     }
 
-    tasks.emplace_back([this, unitIndex](size_t) {
+    tasks.emplace_back([this, unitIndex, &sink](size_t) {
       const WorkUnit& u = workUnits[unitIndex];
       const uint64_t taskStart = NowMicros();
       InterestManager::ProcessRange(
         snapshot, clusters[u.clusterIndex].actorIndices.data() + u.begin,
         u.count, pressureByCluster[u.clusterIndex], policy,
         unitOutputs[unitIndex]);
+      const ClusterOutput& output = unitOutputs[unitIndex];
+      if (!output.sends.empty()) {
+        sink.SendRelayBatch(output.sends.data(), output.sends.size(),
+                            snapshot.rawPacketBytes.data(),
+                            snapshot.rawPacketBytes.size());
+      }
       unitOutputs[unitIndex].elapsedMicros = NowMicros() - taskStart;
     });
   }
@@ -585,10 +764,17 @@ void OffloadDispatcher::RunUnits()
       snapshot, clusters[unit.clusterIndex].actorIndices.data() + unit.begin,
       unit.count, pressureByCluster[unit.clusterIndex], policy,
       unitOutputs[unitIndex]);
+    const ClusterOutput& output = unitOutputs[unitIndex];
+    if (!output.sends.empty()) {
+      sink.SendRelayBatch(output.sends.data(), output.sends.size(),
+                          snapshot.rawPacketBytes.data(),
+                          snapshot.rawPacketBytes.size());
+    }
     unitOutputs[unitIndex].elapsedMicros = NowMicros() - taskStart;
   }
 
   metrics.lastParallelMicros = NowMicros() - parallelStart;
+  } // end else
 }
 
 void OffloadDispatcher::JoinResults(IOffloadSink& sink)
@@ -604,12 +790,6 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
   for (size_t unitIndex = 0; unitIndex < workUnits.size(); ++unitIndex) {
     const WorkUnit& unit = workUnits[unitIndex];
     ClusterOutput& output = unitOutputs[unitIndex];
-
-    if (!output.sends.empty()) {
-      sink.SendRelayBatch(output.sends.data(), output.sends.size(),
-                          snapshot.rawPacketBytes.data(),
-                          snapshot.rawPacketBytes.size());
-    }
 
     for (const MovementVerdict& verdict : output.verdicts) {
       if (verdict.actorIndex >= snapshot.actors.size()) {
@@ -652,6 +832,22 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
       loadBalancer.Observe(clusters[clusterIndex].representative,
                            clusterMicros[clusterIndex], snapshot.tickIndex);
     }
+  }
+
+  // Achieved speedup, and only from ticks that actually used the pool. On a
+  // tick that ran everything on the calling thread the ratio is 1 by
+  // construction, and feeding that in would drag the estimate below the gate's
+  // threshold and keep it there -- the gate would conclude the pool does not
+  // work from evidence gathered without it.
+  if (lastTickOffloaded && metrics.lastParallelMicros > 0 &&
+      metrics.lastAggregateTaskMicros > 0) {
+    const double sample =
+      static_cast<double>(metrics.lastAggregateTaskMicros) /
+      static_cast<double>(metrics.lastParallelMicros);
+    achievedSpeedupEma = achievedSpeedupEma <= 0.0
+      ? sample
+      : kCostEmaAlpha * sample + (1.0 - kCostEmaAlpha) * achievedSpeedupEma;
+    metrics.lastAchievedSpeedup = achievedSpeedupEma;
   }
 
   // Per-actor cost drives next tick's shard budget. Measured rather than

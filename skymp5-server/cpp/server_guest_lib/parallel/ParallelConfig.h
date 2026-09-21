@@ -21,46 +21,56 @@ struct ParallelConfig
 {
   bool enabled = false;
 
-  // Raises the effective minActorsToOffload at run time when the pool is
-  // measurably not paying for itself, and decays it back toward the
-  // configured value when it is.
+  // Decide whether to take movement on by *measuring both paths*, rather than
+  // by comparing a statistic against a threshold.
   //
-  // Opt-in, and unmeasured. It arrived default-on with no test covering it,
-  // and on a 2-core host that was enough to break `Shard count follows the
-  // measured cost`: the first offloaded tick tripped the back-off and the
-  // case never split again. A control loop keyed on wall-clock timing is
-  // load-dependent by construction, so default-on would have made
-  // "deterministic when enabled" untrue and that test flaky. Turn it on only
-  // after the benchmark shows it earning its keep on the target hardware.
-  bool adaptiveParallelism = false;
+  // Every threshold tried here was wrong somewhere, and the last one was
+  // provably wrong: packed 100 players wins at an achieved speedup of 1.66
+  // while a scattered 300 loses at 2.20, so no cut-off takes the first without
+  // taking the second. They are not separable by work per actor either -- both
+  // measure 0.53us. The quantity that decides is the difference between what a
+  // tick costs on each path, and nothing short of running both measures it.
+  //
+  // So periodically the dispatcher runs a trial: short alternating blocks of
+  // accepted and declined ticks, timed end to end and normalised per mover.
+  // Alternating is what makes it a fair comparison -- the population, the
+  // spread and the machine's mood are all held constant across the pair in a
+  // way that measuring one path today and the other tomorrow cannot manage.
+  // Then it coasts on the verdict until the next trial.
+  bool adaptiveParallelism = true;
 
-  // How much slower than running the same work serially the offload may be
-  // before a tick counts against it. 1.05 tolerates 5%.
+  // How often to re-run the trial, in ticks. 1800 is thirty seconds at 60Hz.
   //
-  // The comparison deliberately excludes the join, because both paths pay
-  // the join: it is lastParallelMicros against lastAggregateTaskMicros,
-  // which is what ParallelMetrics::GetLastSpeedup already reports.
-  float adaptiveBias = 1.05f;
+  // The verdict only goes stale when the *shape* of the population changes --
+  // a crowd forming, a city emptying -- which is slow. Between trials the
+  // dispatcher coasts, so the measurement costs nothing.
+  uint32_t abTrialIntervalTicks = 1800;
 
-  // How often, in ticks, a raised threshold decays back toward
-  // minActorsToOffload.
+  // Ticks per block, and blocks per trial. A trial is
+  // abTrialBlockTicks * abTrialBlocks ticks long, half on each path.
   //
-  // Raising and lowering are deliberately asymmetric, because the penalties
-  // are. The `Cost of a wrong offload threshold` case measured a too-low
-  // threshold at 4% in the worst case and nothing anywhere else, against up
-  // to 2.2x for a too-high one. So a rise needs several consecutive bad
-  // ticks, a decay halves the excess rather than stepping down by one, and
-  // the decay floor is the configured minActorsToOffload. The controller
-  // may only ever be more conservative than the operator asked for, never
-  // less.
-  uint32_t adaptiveDecayTicks = 10;
+  // Blocks rather than strict tick-by-tick alternation because the accepted
+  // path has warm-up inside it -- the shard budget is an EMA and the workers
+  // have to be primed -- so a single accepted tick between declined ones would
+  // measure that warm-up rather than the steady state. Four is enough to get
+  // past it and short enough that the population cannot move much.
+  //
+  // At the defaults a trial is 48 ticks out of 1800, half of them on whichever
+  // path turns out to be worse, so the whole mechanism costs well under half a
+  // percent even when the paths differ by 15%.
+  uint32_t abTrialBlockTicks = 4;
+  uint32_t abTrialBlocks = 12;
+
+
+
+
+
 
   // 0 means "auto": an estimate of physical cores minus one for the Node/V8
   // main thread, capped at kMaxAutoWorkerThreads (8). See ParallelConfig.cpp
-  // for what that cap is really doing: it bounds the auto-sized work-unit
-  // count, which is the quantity measurement showed to matter, rather than
-  // the thread count, which it did not. An explicit value here is bounded
-  // only by kMaxWorkerThreads.
+  // for why the cap is there and what it was measured against -- past it,
+  // more threads made the tick markedly slower rather than faster. An
+  // explicit value here is bounded only by kMaxWorkerThreads.
   size_t workerThreads = 0;
 
   // Below this many tracked actors the fork/join barrier costs more than the
@@ -89,7 +99,125 @@ struct ParallelConfig
   //
   // Re-run `./unit/unit "[ParallelBench]"` on the target hardware before
   // changing it.
+  //
+  // NOTE this is a floor, not the main gate. Head count turns out to be the
+  // wrong quantity -- see minOffloadWorkMicros immediately below.
   size_t minActorsToOffload = 100;
+
+  // Least estimated parallel work, in microseconds, that justifies engaging
+  // the pool. This is the gate that actually decides.
+  //
+  // Head count does not decide whether the offload pays; *density* does. The
+  // relay term is quadratic in how many players can see each other, not in how
+  // many are logged in, so the same 300 players cost wildly different amounts
+  // depending on whether they are stood in one market square or spread over a
+  // province. Measured by unit/ParallelSimulation.cpp, 300 players:
+  //
+  //     packed into one chunk    ~90000 relays/tick   offload wins 1.9x
+  //     spread realistically     ~15000 relays/tick   offload loses by 9%
+  //
+  // Gating on actors alone therefore cannot be right for both, and the
+  // previous default of 100 -- calibrated entirely on the packed case --
+  // engaged the pool on spread populations where it cost 74% at 100 players.
+  //
+  // The estimate is the same one the shard budget already uses: measured
+  // per-actor cost from recent ticks times this tick's actor count. It falls
+  // out low for a scattered population and high for a crowd, which is exactly
+  // the distinction that matters.
+  //
+  // Swept against both workloads: `Where the work gate should sit` in
+  // ParallelSimulation.cpp and `Work gate against a packed crowd` in
+  // ParallelBenchmark.cpp. 100 is the value that is right for both; a figure
+  // fitted to either alone is wrong for the other.
+  //
+  // 0 never declines, for an operator who wants the offloaded path
+  // unconditionally -- typically for interest management, which only exists
+  // there.
+  //
+  // This is a floor, not the main gate. It is in absolute microseconds, which
+  // makes it machine-dependent in the wrong direction -- see
+  // minOffloadSpeedup, which is the dimensionless test that actually decides.
+  uint64_t minOffloadWorkMicros = 100;
+
+  // Least parallel speedup the pool must be achieving for the offloaded path
+  // to be worth taking.
+  //
+  // This replaces absolute work as the real gate, because absolute work leans
+  // the wrong way. Both the work and the overhead it has to repay scale with
+  // how fast the machine is, so a microsecond threshold calibrated on one host
+  // is wrong on a slower one -- and worse, on a *contended* host the same
+  // population looks like MORE work and opens the gate wider, exactly when
+  // there are fewest spare cores to give it. Measured on a workstation that
+  // picked up a game mid-session, 300 spread players went from 1.01x against
+  // inline to 1.20x, with the gate happily accepting throughout.
+  //
+  // Achieved speedup is a ratio of two measurements taken on the same machine
+  // in the same conditions, so it is immune to both. It also collapses three
+  // separate questions into one: too little work leaves the barrier dominant
+  // and the ratio near 1; plenty of work with free cores gives a high ratio;
+  // plenty of work with contended cores gives a low one. Decline on a low
+  // ratio is the right answer in all three.
+  //
+  // 2.5, and it is a compromise rather than a clean separation. Quiet machine:
+  //
+  //     packed  players    25     50    100    150    400
+  //             speedup  0.75   0.93   1.66   3.51   7.79
+  //             offload  loses  loses  wins   wins   wins
+  //
+  //     spread  players   100    200    300    500
+  //             speedup     -      -   2.20   2.69
+  //             offload     -      -  loses   wins
+  //
+  // No threshold gets every row right. Packed 100 wins at 1.66 while spread
+  // 300 loses at 2.20, so any value low enough to take the first must take the
+  // second. They are not distinguishable by work per actor either -- both
+  // measure 0.53us. What differs is the overhead: a packed crowd is one
+  // cluster and one work unit, a scattered population is thirty, and the
+  // per-mover overhead measures 0.18us against 0.43us.
+  //
+  // 2.5 therefore buys the spread cases at the cost of the packed ones just
+  // above break-even: spread 300 stops losing 13%, packed 100 stops winning
+  // 3.5%. Scattered is what a live server looks like most of the time, and the
+  // loss avoided is the larger number, so the trade is taken deliberately.
+  //
+  // Doing better than a compromise needs the decision to stop being a
+  // threshold at all: measure what a tick costs on each path and compare them
+  // directly, alternating so the population is held constant across the
+  // comparison. That needs a tick-cost measurement the dispatcher does not
+  // currently get, which is the next piece of work rather than a tuning change.
+  //
+  // 0 disables the test.
+  float minOffloadSpeedup = 2.5f;
+
+  // How long the gate may stay shut before it accepts one tick to find out
+  // whether the world has changed under it.
+  //
+  // Without this the gate latches. A declined tick submits nothing, so nothing
+  // measures what a tick would have cost, so the estimate that drives the
+  // decision freezes at whatever the last accepted tick saw -- and a raid
+  // forming underneath a shut gate could never reopen it. Measured on the
+  // 60->500->60 raid cycle before this existed: 335us mean against 315us for
+  // never declining at all, so the gate was costing more than it saved
+  // precisely when the offload was worth most.
+  //
+  // 240 ticks, four seconds at 60Hz. Measured cost of the probe itself, mean
+  // us/tick on a spread population, by `What the staleness probe costs`:
+  //
+  //     players   inline   no probe    240     60     20
+  //     100         87.1       84.9   85.5   88.1   87.9
+  //     200        220.8      217.5  215.4  224.0  236.9
+  //
+  // A probe every 60 ticks costs 3-4%; every 240 is inside the noise. The
+  // reason a long interval is safe is that the probe is not what notices a
+  // raid: the estimate has two terms, and the *attempt count* half is measured
+  // on declined ticks too, so more players arriving reopens the gate on the
+  // very next tick with no probe involved. The probe only refreshes the other
+  // half -- what one actor costs, which rises as a crowd packs together -- and
+  // that moves at walking pace. Four seconds of lag on it is not observable.
+  //
+  // 0 disables probing, which lets the gate latch on stale evidence. Only
+  // sensible for a server whose density never changes.
+  uint32_t adaptiveProbeIntervalTicks = 240;
 
   // Clusters smaller than this are merged into the inline residual batch
   // rather than being scheduled as their own task.
@@ -166,8 +294,21 @@ struct ParallelConfig
   // share of the tick budget, instead of letting the whole server stall.
   bool adaptiveThrottling = true;
 
-  // Per-tick wall-clock target for the parallel phase, in microseconds.
-  uint64_t targetTickBudgetMicros = 8000;
+  // Work budget for one area per tick, in microseconds. An area whose smoothed
+  // cost exceeds its share of this is judged under pressure, and relays to the
+  // players furthest from it start being spaced out.
+  //
+  // Was 8000. The server loop is `tick(); sleep(1)`, so a tick is a
+  // millisecond of work and change -- a budget of eight of them meant the
+  // throttle only reacted once the server was already catastrophically late,
+  // which is far too late to be called graceful degradation. Measured on 300
+  // players walking into one square, it suppressed zero edges at 8000us and
+  // 22,000 at 1000us.
+  //
+  // 2000 fires when a single area's work is twice what the whole tick has to
+  // give, which is genuinely over budget without being so twitchy that an
+  // ordinary crowd trips it.
+  uint64_t targetTickBudgetMicros = 2000;
 
   // Squared distance beyond which a relay becomes eligible for throttling.
   // Default is one exterior cell (4096 units).

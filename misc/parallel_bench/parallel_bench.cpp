@@ -29,6 +29,7 @@
 #include "parallel/ParallelMetrics.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -43,20 +44,38 @@ namespace {
 // Counts what the join hands over and nothing else. The real sink memcpys
 // into a socket buffer; charging that here would measure the network stack,
 // which both the inline and the offloaded path pay identically.
+// SendRelayBatch is called from the worker that owns the shard, so the two
+// counters it touches are atomic. They are folded once per batch rather than
+// once per relay: a relaxed fetch_add per work unit is lost in the noise,
+// while one per relay would put every worker on the same cache line and
+// charge the offloaded path for contention the real sink does not have.
+// ApplyMovement and SendCorrection are still join-thread only, but are
+// atomic too so that no counter here depends on which thread ran it.
 class CountingSink : public IOffloadSink
 {
 public:
-  void ApplyMovement(const ActorSnapshot&) override { ++applied; }
-  void SendCorrection(const ActorSnapshot&) override { ++corrected; }
+  void ApplyMovement(const ActorSnapshot&) override
+  {
+    applied.fetch_add(1, std::memory_order_relaxed);
+  }
+  void SendCorrection(const ActorSnapshot&) override
+  {
+    corrected.fetch_add(1, std::memory_order_relaxed);
+  }
   void SendRelayBatch(const OutboundSend* sends, size_t count, const uint8_t*,
                       size_t) override
   {
-    relays += count;
+    uint64_t batchBytes = 0;
     for (size_t i = 0; i < count; ++i) {
-      bytes += sends[i].byteLength;
+      batchBytes += sends[i].byteLength;
     }
+    relays.fetch_add(count, std::memory_order_relaxed);
+    bytes.fetch_add(batchBytes, std::memory_order_relaxed);
   }
-  uint64_t applied = 0, corrected = 0, relays = 0, bytes = 0;
+  std::atomic<uint64_t> applied{ 0 };
+  std::atomic<uint64_t> corrected{ 0 };
+  std::atomic<uint64_t> relays{ 0 };
+  std::atomic<uint64_t> bytes{ 0 };
 };
 
 struct Result

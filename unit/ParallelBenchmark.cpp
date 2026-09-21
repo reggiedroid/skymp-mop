@@ -8,9 +8,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <numeric>
 #include <slikenet/BitStream.h>
 #include <vector>
+#include <atomic>
 
 // Measures what the parallel area offload actually buys, instead of arguing
 // about it. Hidden behind the "[.]" tag so ctest never picks it up; run it
@@ -33,13 +33,35 @@ namespace {
 class NullSendTarget : public Networking::ISendTarget
 {
 public:
+  NullSendTarget() { ResetSendCount(); }
+
   void Send(Networking::UserId, Networking::PacketData, size_t, bool) override
   {
-    // Deliberately does nothing: we are measuring server-side relay cost, not
-    // the network stack. Both configurations pay the same zero here.
-    ++sendCount;
+    thread_local size_t local_idx = []() {
+      static std::atomic<size_t> next_idx{0};
+      return next_idx.fetch_add(1, std::memory_order_relaxed) % 64;
+    }();
+    counts[local_idx].count.fetch_add(1, std::memory_order_relaxed);
   }
-  uint64_t sendCount = 0;
+
+  struct alignas(64) PaddedCount {
+    std::atomic<uint64_t> count{0};
+  };
+  PaddedCount counts[64];
+
+  uint64_t GetSendCount() const {
+    uint64_t total = 0;
+    for (int i = 0; i < 64; ++i) {
+      total += counts[i].count.load(std::memory_order_relaxed);
+    }
+    return total;
+  }
+
+  void ResetSendCount() {
+    for (int i = 0; i < 64; ++i) {
+      counts[i].count.store(0, std::memory_order_relaxed);
+    }
+  }
 };
 
 struct Sample
@@ -111,6 +133,31 @@ MpParallel::ParallelConfig MakeConfig(size_t workers)
   // Throttling would change the amount of work done, making the two
   // configurations incomparable. Keep the workload identical.
   config.adaptiveThrottling = false;
+  // Likewise for the offload-threshold controller. It moves the threshold
+  // during the run, so leaving it on means a row of this table is an average
+  // over whatever settings it happened to pass through -- and the pinned
+  // `minActorsToOffload = 1` above stops meaning anything. The controller has
+  // its own case; here it must hold still so everything else is comparable.
+  config.adaptiveParallelism = false;
+  // And the work gate, for the same reason. These cases exist to measure what
+  // the offloaded path costs at each population, including the populations
+  // where it is a bad idea -- that is the whole point of the speedup column.
+  // With the gate at its default the dispatcher would correctly decline the
+  // small ones and the table would report the inline path against itself.
+  // `Work gate against a packed crowd` sets it explicitly and is what measures
+  // the gate.
+  config.minOffloadWorkMicros = 0;
+  config.minOffloadSpeedup = 0.f;
+  config.Normalize();
+  return config;
+}
+
+// Same, but with the adaptive threshold controller left on, for the cases that
+// are specifically measuring it.
+MpParallel::ParallelConfig MakeAdaptiveConfig(size_t workers)
+{
+  MpParallel::ParallelConfig config = MakeConfig(workers);
+  config.adaptiveParallelism = true;
   config.Normalize();
   return config;
 }
@@ -179,7 +226,7 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
     oneTick();
   }
 
-  sendTarget.sendCount = 0;
+  sendTarget.ResetSendCount();
 
   // The phase counters are per-tick and get overwritten, so they are summed
   // as we go. Reading a handful of uint64s per tick is nothing against a tick
@@ -200,12 +247,13 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
       taskSum += m.lastAggregateTaskMicros;
     }
   }
+
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
   Sample sample;
   sample.perTickMicros =
     std::chrono::duration<double, std::micro>(elapsed).count() / ticks;
-  sample.relays = sendTarget.sendCount / static_cast<uint64_t>(ticks);
+  sample.relays = sendTarget.GetSendCount() / static_cast<uint64_t>(ticks);
 
   if (parallel) {
     const MpParallel::ParallelMetrics& m = partOne.GetParallelMetrics();
@@ -400,7 +448,9 @@ struct LoadSegment
 // rather than per-tick averages because segments differ in length and the
 // question is which configuration finishes the whole shift faster.
 double RunLoadProfile(const std::vector<LoadSegment>& profile, int totalPlayers,
-                      bool parallel, const MpParallel::ParallelConfig& config)
+                      bool parallel, const MpParallel::ParallelConfig& config,
+                      uint64_t* outBackoffs = nullptr,
+                      size_t* outFinalThreshold = nullptr)
 {
   PartOne partOne;
   NullSendTarget sendTarget;
@@ -448,6 +498,16 @@ double RunLoadProfile(const std::vector<LoadSegment>& profile, int totalPlayers,
     }
   }
   const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  if (parallel) {
+    const MpParallel::ParallelMetrics& m = partOne.GetParallelMetrics();
+    if (outBackoffs) {
+      *outBackoffs = m.totalTrials;
+    }
+    if (outFinalThreshold) {
+      *outFinalThreshold = m.lastAttemptCount;
+    }
+  }
   return std::chrono::duration<double, std::micro>(elapsed).count();
 }
 
@@ -542,6 +602,109 @@ TEST_CASE("A changing population moves the optimum", "[.][ParallelBench]")
               bestShards);
 
   REQUIRE(best > 0.0);
+}
+
+TEST_CASE("Adaptive threshold controller against a fixed one",
+          "[.][ParallelBench]")
+{
+  // The controller exists to find the offload break-even on hardware nobody
+  // benchmarked. The test of that claim is whether it lands near the fixed
+  // setting that was measured here -- if it is worse than a constant on the
+  // machine the constant was tuned for, it is not tuning, it is noise.
+  constexpr int kTicks = 150;
+  std::printf("\n  us/tick, adaptive threshold vs fixed\n\n");
+  std::printf("  %-8s %10s %10s %10s %8s %9s %8s\n", "players", "inline",
+              "fixed=1", "adaptive", "ratio", "backoffs", "thresh");
+  std::printf("  %s\n", std::string(70, '-').c_str());
+
+  for (int players : { 50, 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+
+    const double fixed =
+      RunLoadProfile({ { kTicks, players } }, players, true, MakeConfig(0)) /
+      kTicks;
+
+    // Reported so a losing row says *why* it lost: a backoff count above zero
+    // means the controller switched the pool off and spent time in the
+    // degraded path, which is the only way it can lose by much.
+    uint64_t backoffs = 0;
+    size_t threshold = 0;
+    const double adaptive =
+      RunLoadProfile({ { kTicks, players } }, players, true,
+                     MakeAdaptiveConfig(0), &backoffs, &threshold) /
+      kTicks;
+
+    std::printf("  %-8d %10.1f %10.1f %10.1f %7.2fx %9llu %8zu\n", players,
+                baseline.perTickMicros, fixed, adaptive, adaptive / fixed,
+                static_cast<unsigned long long>(backoffs), threshold);
+  }
+  std::printf("\n  (>1.00x means the controller is losing to the constant)\n\n");
+}
+
+TEST_CASE("Shipped defaults against a packed crowd", "[.][ParallelBench]")
+{
+  // Every other case in this file pins the gates off, because they exist to
+  // measure the offloaded path itself. That left nothing measuring the
+  // configuration an operator actually gets, on the workload the feature
+  // exists for.
+  //
+  // It matters because the gate is a compromise: minOffloadSpeedup is set to
+  // take the scattered populations a live server spends most of its time at,
+  // and the price is paid by packed crowds that sit just above break-even.
+  // This is where that price shows up, so it is a number rather than a claim.
+  constexpr int kTicks = 150;
+  std::printf("\n  shipped defaults, all players in one chunk\n\n");
+  std::printf("  %-8s %10s %10s %9s\n", "players", "inline", "defaults",
+              "ratio");
+  std::printf("  %s\n", std::string(42, '-').c_str());
+
+  for (int players : { 50, 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+
+    // Deliberately *not* MakeConfig: the point is the shipped values.
+    MpParallel::ParallelConfig config;
+    config.enabled = true;
+    config.Normalize();
+
+    const double defaults =
+      RunLoadProfile({ { kTicks, players } }, players, true, config) / kTicks;
+
+    std::printf("  %-8d %10.1f %10.1f %8.2fx\n", players,
+                baseline.perTickMicros, defaults,
+                defaults / baseline.perTickMicros);
+  }
+  std::printf("\n  (below 1.00x means the shipped configuration is winning)\n\n");
+}
+
+TEST_CASE("Work gate against a packed crowd", "[.][ParallelBench]")
+{
+  // The other half of the evidence for minOffloadWorkMicros. Its companion is
+  // `Where the work gate should sit` in ParallelSimulation.cpp, which measures
+  // a scattered population; this one measures the crowd the offload exists
+  // for. A gate tuned only against the scattered case would switch the pool
+  // off here, which is the one place it is clearly worth having.
+  constexpr int kTicks = 150;
+  std::printf("\n  packed crowd: us/tick by minOffloadWorkMicros\n\n");
+  std::printf("  %-8s %9s", "players", "inline");
+  for (uint64_t g : { 1ull, 50ull, 100ull, 150ull, 250ull, 500ull }) {
+    std::printf(" %8llu", static_cast<unsigned long long>(g));
+  }
+  std::printf("\n  %s\n", std::string(66, '-').c_str());
+
+  for (int players : { 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("  %-8d %9.1f", players, baseline.perTickMicros);
+    for (uint64_t gate : { 1ull, 50ull, 100ull, 150ull, 250ull, 500ull }) {
+      MpParallel::ParallelConfig config = MakeConfig(0);
+      config.minOffloadWorkMicros = gate;
+      config.Normalize();
+      const double total =
+        RunLoadProfile({ { kTicks, players } }, players, true, config);
+      std::printf(" %8.1f", total / kTicks);
+    }
+    std::printf("\n");
+  }
+  std::printf("\n  (1 is effectively no gate)\n\n");
 }
 
 TEST_CASE("Cost of a wrong offload threshold, in both directions",
