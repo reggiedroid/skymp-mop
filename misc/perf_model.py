@@ -1,8 +1,57 @@
 """
-SkyMP Performance Projection Model v2
-======================================
-Calibrated against real benchmark data from unit/ParallelBenchmark.cpp
-on a Ryzen 9950X3D (16 physical cores, 32 threads).
+SkyMP tick-cost model: an exploratory sketch, not a source of defaults
+=======================================================================
+
+Fits a three-phase analytic cost model (ingest, task, join) to the benchmark
+output of unit/ParallelBenchmark.cpp on one machine, a Ryzen 9950X3D, and lets
+you ask what-if questions about it.
+
+WHAT THIS IS NOT
+----------------
+It is not evidence, and no default in ParallelConfig may be set from it.
+
+This project has already shipped one round of numbers derived from a
+relay-edge cost model (the 4x/8x/15x figures) and retracted them when a
+stopwatch disagreed. MOP.md still carries that retraction. This file is the
+same kind of artifact, and two code changes were made from its output before
+anyone checked whether it could support them:
+
+  * kMaxAutoWorkerThreads was raised from 8 to 32, on the reading that
+    "scaling continues smoothly up to the core limit". The model cannot say
+    that. Its only worker-count penalty is a flat per-shard constant, so more
+    workers is better in it almost by construction, and its default path caps
+    the worker search at 8 anyway. The measured table in
+    docs_parallel_area_offload.md argues the other way.
+
+  * A CPUID check raised minShardMicros to 60us on Intel parts, on the reading
+    that "55-95us is optimal for Ice Lake". Run this file and look at what it
+    actually says: the two rows that produce 55 and 95 are the 8-core and
+    4-core Ice Lake profiles, while the 16-core Genoa profile (which is AMD,
+    and which carries the *highest* assumed barrier cost of any profile here)
+    lands at 30. The optimum tracks core count and the assumed barrier
+    scale. It does not track vendor. The model never said what it was cited
+    for.
+
+Both changes have been reverted. The file is kept because the calibration
+against real measurements is worth something as a sanity check, and because a
+model that has been shown its own limits is more useful than one quietly
+deleted.
+
+HOW TO USE IT HONESTLY
+----------------------
+The validation table is the trustworthy half: it compares predictions against
+measurements taken on the machine it was fitted to. Treat a prediction outside
+that range as a hypothesis to go and measure, never as a result.
+
+The hardware profiles below are ASSUMPTIONS. Nobody ran the benchmark on a
+Graviton3 or an Ice Lake part. `ipc` and `barrier_scale` are guesses, and the
+conclusions are only as good as those guesses.
+
+The capacity projections are worse than assumptions. Past the interest-
+management neighbour cap the model's cost is linear in player count by
+construction, so the binary search will happily report five figures of
+concurrent players. That is the model running out of physics, not a capacity
+estimate.
 
 The model decomposes a server tick into three serial phases:
 
@@ -62,10 +111,15 @@ class HardwareProfile:
     def __init__(self, name, physical_cores, ipc, barrier_scale):
         """
         physical_cores: Number of physical CPU cores (NOT vCPUs/logical).
-                        The C++ Normalize() does hardware_concurrency()/2.
-        ipc:            Single-thread IPC relative to baseline (Ryzen 9950X3D = 1.0).
-        barrier_scale:  Multiplier on barrier cost relative to baseline.
-                        Higher for multi-socket, NUMA, or cross-CCD architectures.
+                        The C++ side derives this from sysfs topology, falling
+                        back to /proc/cpuinfo, bounded by affinity and cgroup
+                        quota. See parallel/CoreCount.h.
+        ipc:            ASSUMED single-thread IPC relative to the Ryzen
+                        9950X3D baseline. Not measured on any of these parts.
+        barrier_scale:  ASSUMED multiplier on barrier cost relative to
+                        baseline. Not measured either, and it is the knob that
+                        decides most of what this file prints, so treat any
+                        conclusion that turns on it as a guess.
         """
         self.name = name
         self.physical_cores = physical_cores
@@ -121,7 +175,8 @@ def simulate_parallel(players, hw, interest_mgmt=True, min_shard_micros=20,
     # 2. Task work (parallelizable)
     t_task_total = c_task_edge * edges
 
-    # Auto worker count: min(physical - 1, kMaxAutoWorkerThreads=8)
+    # Auto worker count, mirroring ParallelConfig::Normalize:
+    # min(physical - 1, kMaxAutoWorkerThreads=8)
     if worker_override is not None:
         workers = worker_override
     else:
@@ -182,7 +237,7 @@ def optimize_parameters(hw, players=400):
                 best_cost = cost
                 best_shard = shard_micros
                 best_workers = test_workers
-                
+
     return best_shard, best_workers, best_cost
 def validate_against_benchmarks():
     """Compare model predictions to actual benchmark measurements."""
@@ -217,9 +272,15 @@ def validate_against_benchmarks():
 
 
 def project_hardware():
-    """Project maximum player counts across hardware profiles."""
-    print("\nHardware Scaling Projections")
+    """Extrapolate across assumed hardware profiles. Read the caveats first."""
+    print("\nHardware Scaling Projections  [ASSUMED PROFILES, NOT MEASURED]")
     print("=" * 80)
+    print("  ipc and barrier_scale below are guesses; nobody ran the benchmark")
+    print("  on these parts. The 'Max' columns are worse than guesses: past the")
+    print("  interest-management neighbour cap this model is linear in player")
+    print("  count, so they measure the model running out of physics, not")
+    print("  server capacity. Use the per-tick costs, not the maxima.")
+    print()
     print(f"  {'Hardware':<40} {'Cores':>5} {'Inline Max':>11} {'Par+IM Max':>11} {'@400 par':>10}")
     print(f"  {'-'*77}")
 
@@ -228,7 +289,7 @@ def project_hardware():
         max_par_im = find_max_players(simulate_parallel, hw, interest_mgmt=True)
         cost_400   = simulate_parallel(400, hw, interest_mgmt=True)
         opt_shard, opt_workers, opt_cost = optimize_parameters(hw, 400)
-        
+
         print(f"  {hw.name:<40} {hw.physical_cores:>5} {max_inline:>9} p {max_par_im:>9} p {cost_400/1000:>8.2f} ms")
         print(f"      -> Optimal @400: shard={opt_shard}us, workers={opt_workers}, cost={opt_cost/1000:.2f}ms")
 

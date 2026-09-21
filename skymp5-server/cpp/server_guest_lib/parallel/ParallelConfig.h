@@ -21,26 +21,46 @@ struct ParallelConfig
 {
   bool enabled = false;
 
-  // Dynamically tune minActorsToOffload during runtime based on actual 
-  // execution metrics. Defaults to true as the penalty for configuring
-  // minActorsToOffload too high is heavily asymmetric.
-  bool adaptiveParallelism = true;
+  // Raises the effective minActorsToOffload at run time when the pool is
+  // measurably not paying for itself, and decays it back toward the
+  // configured value when it is.
+  //
+  // Opt-in, and unmeasured. It arrived default-on with no test covering it,
+  // and on a 2-core host that was enough to break `Shard count follows the
+  // measured cost`: the first offloaded tick tripped the back-off and the
+  // case never split again. A control loop keyed on wall-clock timing is
+  // load-dependent by construction, so default-on would have made
+  // "deterministic when enabled" untrue and that test flaky. Turn it on only
+  // after the benchmark shows it earning its keep on the target hardware.
+  bool adaptiveParallelism = false;
 
-  // The overhead tolerance factor. E.g. 1.05 means we allow parallel execution
-  // to be up to 5% slower than the sequential estimate before bailing out.
+  // How much slower than running the same work serially the offload may be
+  // before a tick counts against it. 1.05 tolerates 5%.
+  //
+  // The comparison deliberately excludes the join, because both paths pay
+  // the join: it is lastParallelMicros against lastAggregateTaskMicros,
+  // which is what ParallelMetrics::GetLastSpeedup already reports.
   float adaptiveBias = 1.05f;
 
-  // How frequently (in ticks) we slowly decay the threshold to probe offloading again.
+  // How often, in ticks, a raised threshold decays back toward
+  // minActorsToOffload.
+  //
+  // Raising and lowering are deliberately asymmetric, because the penalties
+  // are. The `Cost of a wrong offload threshold` case measured a too-low
+  // threshold at 4% in the worst case and nothing anywhere else, against up
+  // to 2.2x for a too-high one. So a rise needs several consecutive bad
+  // ticks, a decay halves the excess rather than stepping down by one, and
+  // the decay floor is the configured minActorsToOffload. The controller
+  // may only ever be more conservative than the operator asked for, never
+  // less.
   uint32_t adaptiveDecayTicks = 10;
-
-  // The minimum minActorsToOffload we will ever decay down to.
-  size_t adaptiveThresholdFloor = 30;
 
   // 0 means "auto": an estimate of physical cores minus one for the Node/V8
   // main thread, capped at kMaxAutoWorkerThreads (8). See ParallelConfig.cpp
-  // for why the cap is there and what it was measured against -- past it,
-  // more threads made the tick markedly slower rather than faster. An
-  // explicit value here is bounded only by kMaxWorkerThreads.
+  // for what that cap is really doing: it bounds the auto-sized work-unit
+  // count, which is the quantity measurement showed to matter, rather than
+  // the thread count, which it did not. An explicit value here is bounded
+  // only by kMaxWorkerThreads.
   size_t workerThreads = 0;
 
   // Below this many tracked actors the fork/join barrier costs more than the

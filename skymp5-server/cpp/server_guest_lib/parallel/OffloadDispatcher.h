@@ -14,6 +14,43 @@
 
 namespace MpParallel {
 
+namespace detail {
+
+// One step of the adaptive offload-threshold control loop, extracted as a
+// pure function.
+//
+// The loop it replaces was written inline in ExecuteTick and keyed on
+// wall-clock timings, which made it untestable on any machine and flaky on a
+// slow one. It shipped default-on and broke `Shard count follows the
+// measured cost` on a 2-core host. Separated out, every rule below is a
+// case in ParallelOffloadTest.cpp rather than a hope.
+struct AdaptiveTickInput
+{
+  // Whether the tick just measured actually used the pool.
+  bool offloaded = false;
+  // Wall clock of the fork/join phase, and the serial-equivalent work it
+  // distributed. The join is excluded from both: both paths pay it.
+  uint64_t parallelMicros = 0;
+  uint64_t aggregateTaskMicros = 0;
+  size_t actorCount = 0;
+  uint64_t tickIndex = 0;
+  // The operator's configured value, which is also the decay floor.
+  size_t configuredThreshold = 0;
+  float bias = 1.05f;
+  uint32_t decayTicks = 10;
+};
+
+struct AdaptiveState
+{
+  size_t threshold = 0;
+  size_t disappointingStreak = 0;
+};
+
+[[nodiscard]] AdaptiveState StepAdaptiveThreshold(AdaptiveState state,
+                                                  const AdaptiveTickInput& in);
+
+}
+
 // Everything ActionListener knows about one movement update, flattened into
 // plain data. The dispatcher copies what it needs, so nothing here has to
 // outlive the call.
@@ -155,6 +192,16 @@ public:
     return snapshot.tickIndex;
   }
 
+  // The threshold actually in force. Equal to config.minActorsToOffload
+  // unless adaptiveParallelism has raised it, which is a thing an operator
+  // reading the metrics line needs to be able to see. A server behaving
+  // like the feature is off, while the configured value says it should be
+  // on, is otherwise unexplainable from the outside.
+  [[nodiscard]] size_t GetEffectiveMinActorsToOffload() const noexcept
+  {
+    return currentMinActorsToOffload;
+  }
+
 private:
   // A contiguous slice of one cluster's members. The unit of scheduling.
   //
@@ -173,6 +220,9 @@ private:
   // allowSharding is false on the inline path, where splitting a cluster
   // would only add per-unit bookkeeping to work that runs serially anyway.
   void BuildWorkUnits(bool allowSharding);
+  // Raises or decays currentMinActorsToOffload from the tick just measured.
+  // Only called when config.adaptiveParallelism is set.
+  void UpdateAdaptiveThreshold();
   void RunUnits();
   void JoinResults(IOffloadSink& sink);
   void ResetPool();
@@ -247,10 +297,15 @@ private:
   // the wakeup.
   size_t lastPooledUnitEstimate = 0;
 
-  // Adaptive threshold for the number of actors required to offload to the pool.
-  // Initially matches config.minActorsToOffload, but can be scaled dynamically
-  // if adaptiveParallelism is enabled.
+  // The offload threshold actually in force. Equal to
+  // config.minActorsToOffload unless adaptiveParallelism has raised it; it
+  // never decays below that value, so the controller can only ever be more
+  // conservative than the operator asked for.
   size_t currentMinActorsToOffload = 0;
+
+  // How many ticks in a row the offload has failed the adaptiveBias test.
+  // Reset by any tick that passes it, and by a tick that did not offload.
+  size_t consecutiveDisappointingTicks = 0;
 };
 
 }

@@ -234,6 +234,40 @@ sending everything on one tick and nothing in between.
 This is graceful degradation: a density spike costs distant players some update
 frequency instead of costing everyone a stalled tick.
 
+## Adaptive offload threshold (off by default)
+
+`minActorsToOffload` is a break-even measured on one machine, so it is wrong by
+some margin on every other one. `adaptiveParallelism` lets the dispatcher move
+it at run time: when the fork/join phase repeatedly costs more wall clock than
+the work it distributed, the threshold rises above the current population and
+the pool stops being used; when ticks are running inline again, it decays back
+toward the configured value.
+
+Two things shape it, both from the `Cost of a wrong offload threshold`
+benchmark case. The first is that the penalties are grossly asymmetric: a
+threshold that is too low costs at most 4%, while one that is too high costs up
+to 2.2x and is *worse than leaving the feature off*, because the snapshot split
+is paid as soon as `enabled` is true and only the pool is gated. So raising
+takes three consecutive disappointing ticks, and decay halves the excess every
+`adaptiveDecayTicks` rather than stepping down by one. The second is that the
+floor is the configured `minActorsToOffload` and not something lower: the
+controller may only ever be more conservative than you asked for.
+
+The comparison excludes the join, because both paths pay the join. The
+sequential path runs the same units on the calling thread and joins them
+identically. What is measured is `parallel` against the summed task time, which
+is the `speedup` already in the metrics line.
+
+> **It is off by default, and it is unmeasured.** No benchmark in this
+> repository shows it helping; it exists because the asymmetry argument says
+> something like it should. It also makes the offload decision depend on how
+> loaded the machine was a tick ago, which is at odds with the determinism
+> property the rest of this subsystem holds. An earlier revision shipped it
+> default-on, and on a 2-core host that was enough to make `Shard count follows
+> the measured cost` fail: the first offloaded tick tripped the back-off and
+> the case never split again. Turn it on only after watching the metrics line
+> on your own hardware.
+
 ## Configuration
 
 Add a `parallelism` object to `server-settings.json`:
@@ -245,6 +279,9 @@ Add a `parallelism` object to `server-settings.json`:
     "enabled": true,
     "workerThreads": 0,
     "minActorsToOffload": 100,
+    "adaptiveParallelism": false,
+    "adaptiveBias": 1.05,
+    "adaptiveDecayTicks": 10,
     "minClusterActors": 4,
     "minShardActors": 4,
     "minShardMicros": 20,
@@ -267,8 +304,11 @@ Add a `parallelism` object to `server-settings.json`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Master switch. Off means the original code path, byte for byte. |
-| `workerThreads` | `0` | `0` auto-detects: estimated physical cores minus one for the Node thread, capped at **8**. More is not better — see the worker-count table above. An explicit value is capped at 32. |
+| `workerThreads` | `0` | `0` auto-detects: physical cores minus one for the Node thread, capped at **8**. Physical cores come from sysfs topology, falling back to `/proc/cpuinfo`, and are bounded by the CPUs this process may actually run on (affinity mask and cgroup quota included), which matters in a container, where `/proc/cpuinfo` lists the host's processors. More is not better; see the worker-count table above. An explicit value is capped at 32. |
 | `minActorsToOffload` | `100` | Below this the thread pool costs more than it saves — measured, see the table above. Note it only gates the pool: packets are still flattened into the snapshot, so below it the feature buys interest management and costs a few percent of tick time. |
+| `adaptiveParallelism` | `false` | Lets the dispatcher raise `minActorsToOffload` at run time when the pool is not paying for itself, and decay it back. Unmeasured; see the section above before enabling. |
+| `adaptiveBias` | `1.05` | How much slower than the work it distributed the fork/join phase may be before a tick counts against the pool. Clamped up to 1.0. |
+| `adaptiveDecayTicks` | `10` | How often a raised threshold halves its excess back toward `minActorsToOffload`. Only read when `adaptiveParallelism` is on. |
 | `interestManagement` | `true` | Distance-based update-rate reduction, always on. The highest-value setting here. |
 | `interestFullRateUnits` | `2048` | Recipients closer than this always get every update. |
 | `maxInterestSkipTicks` | `4` | Ceiling on how far apart interest management may space an update. |

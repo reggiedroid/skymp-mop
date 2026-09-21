@@ -31,6 +31,13 @@ constexpr uint64_t kEvictIntervalTicks = 4096;
 // wrong rather than that the server is busy.
 constexpr size_t kMaxPendingSubmissions = 200000;
 
+// Consecutive ticks the offload must disappoint before the adaptive
+// controller raises the threshold. One tick is a scheduling hiccup: a GC
+// pause on the Node thread, or another process taking a core for a
+// millisecond. Raising on one of those would suspend the pool for the whole
+// decay window, which is the expensive half of an asymmetric penalty.
+constexpr size_t kAdaptiveBackoffTicks = 3;
+
 // Weight of the newest sample in the per-actor cost estimate. Low enough that
 // one tick which collided with a GC pause does not resize every shard, high
 // enough to follow a crowd forming over a couple of seconds.
@@ -77,6 +84,7 @@ void OffloadDispatcher::Reconfigure(const ParallelConfig& newConfig)
   // different configuration.
   microsPerActorEma = 0.0;
   currentMinActorsToOffload = config.minActorsToOffload;
+  consecutiveDisappointingTicks = 0;
   ResetPool();
 }
 
@@ -237,20 +245,7 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   JoinResults(sink);
 
   if (config.adaptiveParallelism) {
-    if (lastTickOffloaded) {
-      uint64_t parallelWall = metrics.lastParallelMicros + metrics.lastJoinMicros;
-      // Use the bias to favor offloading due to asymmetric penalty
-      if (parallelWall > metrics.lastAggregateTaskMicros * config.adaptiveBias) {
-        // Offload was slower than sequential would have been. Back off quickly.
-        currentMinActorsToOffload = snapshot.actors.size() + 10;
-      }
-    } else {
-      // Slowly decay the threshold to probe offloading again.
-      if (snapshot.tickIndex % config.adaptiveDecayTicks == 0 &&
-          currentMinActorsToOffload > config.adaptiveThresholdFloor) {
-        currentMinActorsToOffload--;
-      }
-    }
+    UpdateAdaptiveThreshold();
   }
 
   if (pool) {
@@ -362,6 +357,86 @@ void OffloadDispatcher::BuildWorkUnits(bool allowSharding)
   for (size_t i = 0; i < workUnits.size(); ++i) {
     unitOutputs[i].Reset();
   }
+}
+
+namespace detail {
+
+AdaptiveState StepAdaptiveThreshold(AdaptiveState state,
+                                    const AdaptiveTickInput& in)
+{
+  const size_t floor = in.configuredThreshold;
+
+  if (in.offloaded) {
+    // Compare like with like. The join is paid by both paths (the
+    // sequential path runs the same units on the calling thread and then
+    // joins them identically), so charging it to the offload makes a tick
+    // look bad at exactly the populations where the offload is winning. What
+    // the offload is answerable for is its fork/join phase against the work
+    // it distributed, which is ParallelMetrics::GetLastSpeedup inverted.
+    const double tolerated = static_cast<double>(in.aggregateTaskMicros) *
+      static_cast<double>(in.bias);
+    const bool disappointing =
+      static_cast<double>(in.parallelMicros) > tolerated;
+
+    if (!disappointing) {
+      state.disappointingStreak = 0;
+      return state;
+    }
+
+    // One bad tick is a scheduling hiccup, not a verdict. Raising is the
+    // expensive direction: `Cost of a wrong offload threshold` measured a
+    // too-high threshold at up to 2.2x, and worse than leaving the feature
+    // off entirely, against 4% for a too-low one. So it takes several ticks
+    // in a row, and it stops just above the population that disappointed
+    // rather than overshooting past it.
+    if (++state.disappointingStreak < kAdaptiveBackoffTicks) {
+      return state;
+    }
+    state.disappointingStreak = 0;
+    state.threshold = std::max(floor, in.actorCount + 1);
+    return state;
+  }
+
+  state.disappointingStreak = 0;
+
+  // Decaying is the cheap direction, so it does not crawl. Stepping down by
+  // one every ten ticks would take roughly a minute at 60Hz to walk a
+  // 400-player back-off down to the configured value, and every tick of that
+  // minute pays the snapshot split without the parallelism that justifies it.
+  if (state.threshold <= floor) {
+    state.threshold = floor;
+    return state;
+  }
+  if (in.decayTicks == 0 || in.tickIndex % in.decayTicks != 0) {
+    return state;
+  }
+  const size_t excess = state.threshold - floor;
+  state.threshold -= std::max<size_t>(excess / 2, 1);
+  return state;
+}
+
+}
+
+void OffloadDispatcher::UpdateAdaptiveThreshold()
+{
+  detail::AdaptiveTickInput in;
+  in.offloaded = lastTickOffloaded;
+  in.parallelMicros = metrics.lastParallelMicros;
+  in.aggregateTaskMicros = metrics.lastAggregateTaskMicros;
+  in.actorCount = snapshot.actors.size();
+  in.tickIndex = snapshot.tickIndex;
+  in.configuredThreshold = config.minActorsToOffload;
+  in.bias = config.adaptiveBias;
+  in.decayTicks = config.adaptiveDecayTicks;
+
+  detail::AdaptiveState state;
+  state.threshold = currentMinActorsToOffload;
+  state.disappointingStreak = consecutiveDisappointingTicks;
+
+  state = detail::StepAdaptiveThreshold(state, in);
+
+  currentMinActorsToOffload = state.threshold;
+  consecutiveDisappointingTicks = state.disappointingStreak;
 }
 
 void OffloadDispatcher::RunUnits()
