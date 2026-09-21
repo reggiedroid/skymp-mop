@@ -1,6 +1,7 @@
 #include "parallel/AreaPartitioner.h"
 #include <algorithm>
 #include <catch2/catch_all.hpp>
+#include <functional>
 #include <set>
 #include <vector>
 
@@ -254,4 +255,89 @@ TEST_CASE("AreaKey distance and hashing behave", "[ParallelPartition]")
 
   // Negative coordinates must not collide with their positive twins.
   REQUIRE(hash(AreaKey{ 0x3c, -1, -1 }) != hash(AreaKey{ 0x3c, 1, 1 }));
+}
+
+TEST_CASE("Clusters are the connected components of the separation relation",
+          "[ParallelPartition]")
+{
+  // The definition, checked against a second implementation rather than
+  // against an example. The fast path walks only the forward half of each
+  // window and leans on the key list being sorted; the reference below is the
+  // naive O(n^2) closure. On a few hundred chunks scattered over three grids
+  // they must induce exactly the same partition, at every separation.
+  //
+  // Both directions matter and they fail differently. A cluster that is too
+  // small splits a group that can see each other across two work units, which
+  // is the bug the separation exists to prevent. A cluster that is too large
+  // is merely slower -- until it is the whole map, at which point scheduling
+  // and pressure accounting stop meaning anything.
+  uint64_t rngState = 0x243f6a8885a308d3ULL;
+  const auto next = [&rngState]() {
+    rngState ^= rngState >> 12;
+    rngState ^= rngState << 25;
+    rngState ^= rngState >> 27;
+    return rngState * 0x2545f4914f6cdd1dULL;
+  };
+
+  for (const int32_t separation : { 3, 4, 6, 9 }) {
+    std::vector<ActorSnapshot> actors;
+    for (uint32_t i = 0; i < 400; ++i) {
+      const uint32_t world = (next() % 3 == 0) ? 0x1f4 : 0x3c;
+      // A range narrow enough that plenty of pairs land inside the
+      // separation, wide enough that plenty do not.
+      const auto x =
+        static_cast<int16_t>(static_cast<int32_t>(next() % 61) - 30);
+      const auto y =
+        static_cast<int16_t>(static_cast<int32_t>(next() % 61) - 30);
+      actors.push_back(MakeActor(0xff000001 + i, world, x, y));
+    }
+
+    AreaPartitioner partitioner;
+    std::vector<AreaCluster> clusters;
+    partitioner.Partition(actors, separation, clusters);
+
+    // Reference: union every pair that the relation connects, the slow way.
+    std::vector<size_t> parent(actors.size());
+    for (size_t i = 0; i < parent.size(); ++i) {
+      parent[i] = i;
+    }
+    std::function<size_t(size_t)> find = [&parent, &find](size_t node) {
+      while (parent[node] != node) {
+        parent[node] = parent[parent[node]];
+        node = parent[node];
+      }
+      return node;
+    };
+    for (size_t i = 0; i < actors.size(); ++i) {
+      for (size_t j = i + 1; j < actors.size(); ++j) {
+        const int32_t distance =
+          actors[i].area.ChunkDistanceTo(actors[j].area);
+        if (distance >= 0 && distance <= separation) {
+          parent[find(i)] = find(j);
+        }
+      }
+    }
+
+    // Same equivalence classes: two actors share a cluster exactly when the
+    // reference says they are connected.
+    for (size_t i = 0; i < actors.size(); ++i) {
+      for (size_t j = i + 1; j < actors.size(); ++j) {
+        const bool sameCluster =
+          actors[i].clusterIndex == actors[j].clusterIndex;
+        REQUIRE(sameCluster == (find(i) == find(j)));
+      }
+    }
+
+    // And the ordering the join relies on: clusters ascend by their smallest
+    // key, and each member list ascends.
+    for (size_t c = 1; c < clusters.size(); ++c) {
+      REQUIRE(clusters[c - 1].representative < clusters[c].representative);
+    }
+    for (const AreaCluster& cluster : clusters) {
+      REQUIRE(std::is_sorted(cluster.actorIndices.begin(),
+                             cluster.actorIndices.end()));
+    }
+
+    RequireClustersAreIndependent(actors, separation);
+  }
 }

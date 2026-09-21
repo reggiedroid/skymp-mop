@@ -1,6 +1,7 @@
 #include "AreaPartitioner.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <limits>
 
 namespace MpParallel {
@@ -99,17 +100,31 @@ void AreaPartitioner::Partition(std::vector<ActorSnapshot>& actors,
   }
   chunkKeys.swap(sortedChunkKeys);
 
-  for (auto& entry : chunkIndexByKey) {
-    entry.second = chunkRemap[entry.second];
-  }
+  // chunkIndexByKey is not remapped with them. It exists to deduplicate
+  // chunks in pass 1 and nothing reads it afterwards -- pass 2 searches the
+  // sorted key list instead -- so rewriting one entry per occupied chunk
+  // would be a pass over a hash table for no reader. It is cleared at the top
+  // of every Partition, so no stale index survives the call.
   for (uint32_t& slot : actorChunkSlot) {
     slot = chunkRemap[slot];
   }
 
-  // Pass 2: union chunks that are within `separation` of each other. Probing
-  // the (2S+1)^2 window around each chunk costs a constant per chunk, which
-  // beats comparing every pair once more than a handful of chunks are
-  // occupied.
+  // Pass 2: union chunks that are within `separation` of each other.
+  //
+  // Two properties make this cheaper than it looks. Pairs are symmetric, so
+  // only the forward half of the window is walked: columns x..x+S, and in the
+  // sender's own column only the rows below it. And chunkKeys is sorted by
+  // (world, x, y), so each column of that half-window is a contiguous run --
+  // one binary search finds where it starts and the scan walks sequential
+  // memory until it leaves the row range.
+  //
+  // What it replaces was a lookup in chunkIndexByKey for each of the
+  // (2S+1)^2 - 1 cells around every occupied chunk: at the default
+  // separation, eighty random probes into a hash table per chunk. That is
+  // invisible on a crowd, which occupies one chunk, and is the largest single
+  // cost in the tick on a population spread across a map, which occupies
+  // hundreds. Measured on this machine by `Partitioning alone` in
+  // misc/parallel_bench, before and after; the numbers are in its README.
   parent.resize(chunkCount);
   unionRank.assign(chunkCount, 0);
   for (uint32_t i = 0; i < chunkCount; ++i) {
@@ -118,26 +133,41 @@ void AreaPartitioner::Partition(std::vector<ActorSnapshot>& actors,
 
   for (uint32_t i = 0; i < chunkCount; ++i) {
     const AreaKey& key = chunkKeys[i];
-    for (int32_t dx = -separation; dx <= separation; ++dx) {
-      const int32_t nx = static_cast<int32_t>(key.chunkX) + dx;
-      if (nx < kInt16Min || nx > kInt16Max) {
+    const int32_t keyX = static_cast<int32_t>(key.chunkX);
+    const int32_t keyY = static_cast<int32_t>(key.chunkY);
+
+    for (int32_t dx = 0; dx <= separation; ++dx) {
+      const int32_t nx = keyX + dx;
+      if (nx > kInt16Max) {
+        break;
+      }
+
+      // Own column: only the rows after this one, or the pair would be
+      // united twice. Every other column: the full row range.
+      const int32_t loY = (dx == 0) ? keyY + 1 : keyY - separation;
+      const int32_t hiY = keyY + separation;
+      if (loY > hiY || loY > kInt16Max || hiY < kInt16Min) {
         continue;
       }
-      for (int32_t dy = -separation; dy <= separation; ++dy) {
-        if (dx == 0 && dy == 0) {
-          continue;
-        }
-        const int32_t ny = static_cast<int32_t>(key.chunkY) + dy;
-        if (ny < kInt16Min || ny > kInt16Max) {
-          continue;
-        }
 
-        const AreaKey probe{ key.worldOrCell, static_cast<int16_t>(nx),
-                             static_cast<int16_t>(ny) };
-        auto it = chunkIndexByKey.find(probe);
-        if (it != chunkIndexByKey.end()) {
-          Unite(i, it->second);
+      const AreaKey lo{ key.worldOrCell, static_cast<int16_t>(nx),
+                        static_cast<int16_t>(std::max(loY, kInt16Min)) };
+
+      // The column's run starts here. Searching only the part of the list
+      // after i is safe because everything before it sorts lower, and keeps
+      // the search shallow on the columns closest to home.
+      const auto begin = chunkKeys.begin() + static_cast<std::ptrdiff_t>(i);
+      auto it = std::lower_bound(begin, chunkKeys.end(), lo);
+
+      for (; it != chunkKeys.end(); ++it) {
+        if (it->worldOrCell != key.worldOrCell ||
+            static_cast<int32_t>(it->chunkX) != nx) {
+          break;
         }
+        if (static_cast<int32_t>(it->chunkY) > hiY) {
+          break;
+        }
+        Unite(i, static_cast<uint32_t>(it - chunkKeys.begin()));
       }
     }
   }

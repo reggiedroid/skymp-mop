@@ -188,6 +188,88 @@ which was removed for a reason that does not need a benchmark: its trigger was
 `minShardMicros == 20`, the documented default, so it could not tell an
 operator who had measured 20 from someone who had never touched it.
 
+## Results, 2026-09-21: the shapes a live server is actually in
+
+Everything above this heading measures one population: every player inside a
+single 4096-unit chunk, everybody visible to everybody. That is the shape the
+offload exists for and the shape it is least often given. Two more were added
+for the first live test, both driven from `Shape` in `parallel_bench.cpp`:
+
+- **province** — half the population spread across four hubs of uneven size
+  (one busy capital, two towns, one of them in a second worldspace), the rest
+  scattered over roughly 45x45 chunks in ones and twos, a tenth of them
+  indoors in their own cells. Everyone submits every tick; nobody changes
+  chunk.
+- **roaming** — the same province plus parties of eight walking a heading of
+  their own at just under a chunk per tick, so cluster membership churns and
+  the partition has to be rebuilt in earnest rather than reproduced.
+
+Same host as above. 150 timed ticks per point after 40 warm-up, median of
+`ExecuteTick`, three full runs of each variant, alternating.
+
+### Partitioning is what a spread-out population costs
+
+`AreaPartitioner::Partition` timed on its own, separation 4, because it is the
+one phase whose cost is driven by how far apart the players are rather than by
+how many of them there are. A crowd occupies one chunk and it is free; a map
+occupies hundreds and it was the largest single item in the tick.
+
+| actors | occupied chunks | before | after | |
+| --- | --- | --- | --- | --- |
+| 100 | 99 | 59.9 / 44.1 / 47.6µs | 7.5 / 7.2 / 7.4µs | **6.6×** |
+| 200 | 196 | 84.8 / 84.3 / 91.7µs | 15.5 / 14.3 / 15.3µs | **5.7×** |
+| 400 | 380 | 301.6 / 291.0 / 333.4µs | 32.7 / 30.7 / 32.4µs | **9.6×** |
+| 800 | 718 | 705.3 / 708.5 / 767.4µs | 72.4 / 75.7 / 71.7µs | **9.8×** |
+| 1600 | 1262 | 1281 / 1294 / 1400µs | 284 / 289 / 289µs | **4.5×** |
+
+Same population in one chunk, for scale: 1.4–2.5µs at 100 actors and
+10–12µs at 800, before and after alike. The pass being replaced was a hash
+lookup for each of the `(2S+1)² - 1` cells around every occupied chunk —
+eighty random probes per chunk at the default separation. What replaced it
+walks only the forward half of the window and finds each column with a binary
+search into the already-sorted chunk list, which is one comparison per
+candidate on sequential memory. Both produce the same clusters: `Clusters are
+the connected components of the separation relation` in
+`unit/ParallelPartitionerTest.cpp` checks that against a naive O(n²) closure
+at four separations, and fails if the window is narrowed by one column.
+
+### What the whole tick costs on those populations
+
+Both arms priced with the decline grounds forced off, for the reason the
+previous section gives. `inline` is the dispatcher running the same work
+serially in one synthetic cluster; it does not partition, so it is a *harder*
+baseline here than the ratios suggest.
+
+| shape | players | before | after |
+| --- | --- | --- | --- |
+| province | 100 | 0.14 / 0.17 / 0.15× | 0.36 / 0.36 / 0.25× |
+| province | 200 | 0.27 / 0.28 / 0.27× | 0.57 / 0.59 / 0.62× |
+| province | 400 | 0.57 / 0.66 / 0.66× | **1.37 / 1.36 / 1.34×** |
+| province | 800 | 0.71 / 0.69 / 0.68× | **2.42 / 2.29 / 2.23×** |
+| roaming | 100 | 0.13 / 0.15 / 0.15× | 0.28 / 0.36 / 0.33× |
+| roaming | 200 | 0.21 / 0.22 / 0.20× | 0.52 / 0.49 / 0.51× |
+| roaming | 400 | 0.40 / 0.44 / 0.42× | **1.11 / 1.13 / 1.00×** |
+| roaming | 800 | 0.62 / 0.62 / 0.62× | **1.86 / 1.87 / 1.87×** |
+
+Above 1.0 the offloaded path is cheaper. The change moves the break-even on a
+map population from *never* to about 400 players, which is the first time this
+harness has shown the offload paying on anything but a crowd. Below that it
+still loses, and it should: at 100 spread players there are 700 relay edges in
+the whole tick, and no amount of parallelism repays a fork and a join for
+that. **Declining is the correct answer there and the gate reaches it on its
+own** — these rows exist to price the path the gate refuses, not to argue it
+should stop refusing.
+
+What the table does not say:
+
+- Nothing here is end-to-end. There is no ingest and no `PartOne`, and both
+  paths pay those, so every ratio is further from 1.0 than the same ratio
+  measured through `unit/ParallelBenchmark.cpp`.
+- The relay counts are what make the shapes different, and they are in the
+  output: 704 edges at province 100 against 47,776 at province 800, versus
+  160,000 for 400 packed players. Density decides, not head count.
+- One machine, and one that was otherwise idle.
+
 ## Reproducing
 
 The dependencies are header-only and need no root:

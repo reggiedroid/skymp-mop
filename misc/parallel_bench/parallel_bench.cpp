@@ -23,6 +23,7 @@
 //   * One machine is one machine. Nothing here may become a shipped default
 //     on its own; see misc/perf_model.py for the rule this follows.
 
+#include "parallel/AreaPartitioner.h"
 #include "parallel/CoreCount.h"
 #include "parallel/OffloadDispatcher.h"
 #include "parallel/ParallelConfig.h"
@@ -89,6 +90,13 @@ struct Result
   size_t workUnits = 0;
   uint64_t relays = 0;
 
+  // What the population looked like to the partitioner. Meaningless for the
+  // packed shape, where they are always 1, 1 and everybody; the point of the
+  // map shapes is that they are not.
+  size_t clusters = 0;
+  size_t chunks = 0;
+  size_t largestCluster = 0;
+
   // No timed tick took any work on. The dispatcher declined, which under the
   // A/B-trial gate means the tick's work belongs to ActionListener and never
   // reaches ExecuteTick at all -- so every number above is the cost of doing
@@ -99,12 +107,180 @@ struct Result
   uint64_t acceptedSubmissions = 0;
 };
 
+// The shapes a population can have.
+//
+// Packed is the one the framework exists for and the one every sweep above
+// this comment uses: one chunk, everybody visible to everybody, the N^2 relay
+// term at full strength. It is also the shape a live server is in least
+// often, which is why the other two exist.
+enum class Shape
+{
+  // One chunk, all moving.
+  Packed,
+  // Cities and country: half the population concentrated in four hubs of
+  // uneven size, the rest spread over the map in ones and twos, some indoors.
+  // Nobody moves far, so the partition is stable tick to tick.
+  Province,
+  // The same province, plus parties of eight walking at a little under a
+  // chunk per tick on headings of their own, so cluster membership churns and
+  // the partition has to be rebuilt in earnest every tick.
+  Roaming
+};
+
+const char* ShapeName(Shape shape)
+{
+  switch (shape) {
+    case Shape::Packed:
+      return "packed";
+    case Shape::Province:
+      return "province";
+    case Shape::Roaming:
+      return "roaming";
+  }
+  return "?";
+}
+
+struct BenchPlayer
+{
+  float pos[3] = { 0.f, 0.f, 0.f };
+  float vel[2] = { 0.f, 0.f };
+  uint32_t worldOrCell = 0x3c;
+};
+
+// Deterministic so that two runs of the benchmark compare like with like.
+// xorshift64*.
+class Rng
+{
+public:
+  explicit Rng(uint64_t seed)
+    : state(seed)
+  {
+  }
+  uint64_t Next()
+  {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return state * 0x2545f4914f6cdd1dULL;
+  }
+  float Float(float lo, float hi)
+  {
+    const double unit =
+      static_cast<double>(Next() >> 11) / static_cast<double>(1ULL << 53);
+    return static_cast<float>(lo + unit * (hi - lo));
+  }
+
+private:
+  uint64_t state;
+};
+
+struct BenchHub
+{
+  uint32_t worldOrCell;
+  float x;
+  float y;
+  float radius;
+  int weight; // out of 100, among hub dwellers
+};
+
+// One busy capital and three smaller towns, tens of chunks apart. Uneven on
+// purpose: equal hubs would hide whether the biggest is being sharded.
+const BenchHub kBenchHubs[] = {
+  { 0x3c, 10000.f, 10000.f, 1800.f, 45 },
+  { 0x3c, -70000.f, 35000.f, 3000.f, 25 },
+  { 0x3c, 50000.f, -60000.f, 2400.f, 20 },
+  { 0x1f4, -20000.f, -20000.f, 2000.f, 10 }
+};
+
+std::vector<BenchPlayer> MakePopulation(Shape shape, size_t players)
+{
+  std::vector<BenchPlayer> population;
+  population.reserve(players);
+
+  if (shape == Shape::Packed) {
+    for (size_t i = 0; i < players; ++i) {
+      BenchPlayer player;
+      player.pos[0] = static_cast<float>(i % 64) * 60.f;
+      player.pos[1] = static_cast<float>(i / 64) * 60.f;
+      population.push_back(player);
+    }
+    return population;
+  }
+
+  Rng rng(0x5eed0f0fULL);
+  const size_t hubCount = sizeof(kBenchHubs) / sizeof(kBenchHubs[0]);
+
+  // In Roaming, an eighth of the population is out on the roads in parties of
+  // eight; the rest is the same province.
+  const size_t partyPlayers =
+    shape == Shape::Roaming ? (players / 8) / 8 * 8 : 0;
+
+  for (size_t i = 0; i < players - partyPlayers; ++i) {
+    BenchPlayer player;
+    const uint64_t roll = rng.Next() % 100;
+    if (roll < 50) {
+      // Pick a hub by weight.
+      int pick = static_cast<int>(rng.Next() % 100);
+      size_t hub = 0;
+      for (size_t h = 0; h < hubCount; ++h) {
+        pick -= kBenchHubs[h].weight;
+        if (pick < 0) {
+          hub = h;
+          break;
+        }
+      }
+      player.worldOrCell = kBenchHubs[hub].worldOrCell;
+      player.pos[0] =
+        kBenchHubs[hub].x + rng.Float(-kBenchHubs[hub].radius,
+                                      kBenchHubs[hub].radius);
+      player.pos[1] =
+        kBenchHubs[hub].y + rng.Float(-kBenchHubs[hub].radius,
+                                      kBenchHubs[hub].radius);
+    } else if (roll < 60) {
+      // Indoors: its own grid, two or three players each.
+      player.worldOrCell = 0x10000 + static_cast<uint32_t>(i % 12);
+      player.pos[0] = rng.Float(-2000.f, 2000.f);
+      player.pos[1] = rng.Float(-2000.f, 2000.f);
+    } else {
+      player.worldOrCell = 0x3c;
+      player.pos[0] = rng.Float(-90000.f, 90000.f);
+      player.pos[1] = rng.Float(-90000.f, 90000.f);
+    }
+    player.pos[2] = rng.Float(-500.f, 500.f);
+    // Everyone twitches a little, which is what a standing player's client
+    // still sends. Far too small to change chunk.
+    player.vel[0] = rng.Float(-6.f, 6.f);
+    player.vel[1] = rng.Float(-6.f, 6.f);
+    population.push_back(player);
+  }
+
+  for (size_t party = 0; party < partyPlayers / 8; ++party) {
+    const float originX = rng.Float(-60000.f, 60000.f);
+    const float originY = rng.Float(-60000.f, 60000.f);
+    const float velX = rng.Float(-3000.f, 3000.f);
+    const float velY = rng.Float(-3000.f, 3000.f);
+    for (size_t m = 0; m < 8; ++m) {
+      BenchPlayer player;
+      player.worldOrCell = 0x3c;
+      player.pos[0] = originX + rng.Float(-300.f, 300.f);
+      player.pos[1] = originY + rng.Float(-300.f, 300.f);
+      player.vel[0] = velX;
+      player.vel[1] = velY;
+      population.push_back(player);
+    }
+  }
+
+  return population;
+}
+
 // Every player in one chunk, every player moving every tick: the N^2 relay
-// case, which is the shape the framework exists for.
+// case, which is the shape the framework exists for. `shape` widens that to
+// the populations a live server actually has; see Shape above.
 Result Run(size_t players, size_t workers, size_t maxShards,
            uint32_t minShardMicros, int ticks, int warmup,
            bool forceInline = false, uint32_t spinMicros = UINT32_MAX,
-           bool forceAccept = false, bool relayFromWorkers = false)
+           bool forceAccept = false, bool relayFromWorkers = false,
+           Shape shape = Shape::Packed)
 {
   ParallelConfig config;
   config.enabled = true;
@@ -162,35 +338,40 @@ Result Run(size_t players, size_t workers, size_t maxShards,
   CountingSink sink;
   Result out;
 
+  std::vector<BenchPlayer> population = MakePopulation(shape, players);
+
   for (int tick = 0; tick < warmup + ticks; ++tick) {
     std::vector<RelayTarget> targets;
     targets.reserve(players);
     for (size_t i = 0; i < players; ++i) {
-      // All inside one 4096-unit chunk.
-      const float x = static_cast<float>(i % 64) * 60.f;
-      const float y = static_cast<float>(i / 64) * 60.f;
+      const BenchPlayer& player = population[i];
 
       RelayTarget target;
       target.userId = static_cast<Networking::UserId>(i);
       target.listenerFormId = 0xff000001 + static_cast<uint32_t>(i);
-      target.worldOrCell = 0x3c;
-      target.chunkX = static_cast<int16_t>(x / 4096.f);
-      target.chunkY = static_cast<int16_t>(y / 4096.f);
-      target.pos[0] = x;
-      target.pos[1] = y;
+      target.worldOrCell = player.worldOrCell;
+      target.chunkX = ToChunkCoord(player.pos[0]);
+      target.chunkY = ToChunkCoord(player.pos[1]);
+      target.pos[0] = player.pos[0];
+      target.pos[1] = player.pos[1];
+      target.pos[2] = player.pos[2];
       targets.push_back(target);
 
       MovementSubmission submission;
       submission.formId = 0xff000001 + static_cast<uint32_t>(i);
       submission.idx = static_cast<uint32_t>(i);
       submission.ownerUserId = static_cast<Networking::UserId>(i);
-      submission.currentPos[0] = x;
-      submission.currentPos[1] = y;
-      submission.currentWorldOrCell = 0x3c;
-      // A short step, so validation accepts it and the actor stays put.
-      submission.proposedPos[0] = x + 1.f;
-      submission.proposedPos[1] = y + 1.f;
-      submission.proposedWorldOrCell = 0x3c;
+      submission.currentPos[0] = player.pos[0];
+      submission.currentPos[1] = player.pos[1];
+      submission.currentPos[2] = player.pos[2];
+      submission.currentWorldOrCell = player.worldOrCell;
+      // A step the validator accepts: under a chunk, same grid.
+      submission.proposedPos[0] = player.pos[0] +
+        (shape == Shape::Packed ? 1.f : player.vel[0]);
+      submission.proposedPos[1] = player.pos[1] +
+        (shape == Shape::Packed ? 1.f : player.vel[1]);
+      submission.proposedPos[2] = player.pos[2];
+      submission.proposedWorldOrCell = player.worldOrCell;
       submission.isStanding = true;
       submission.packetData = packet.data();
       submission.packetLength = packet.size();
@@ -203,6 +384,22 @@ Result Run(size_t players, size_t workers, size_t maxShards,
       }
     }
     dispatcher.SetPotentialTargets(std::move(targets));
+
+    // The travellers actually travel. Everyone else twitches in place, which
+    // is enough to keep every player submitting without moving the partition.
+    if (shape != Shape::Packed) {
+      for (BenchPlayer& player : population) {
+        player.pos[0] += player.vel[0];
+        player.pos[1] += player.vel[1];
+        // Turn round at the edge of the map rather than walking off it.
+        if (player.pos[0] > 95000.f || player.pos[0] < -95000.f) {
+          player.vel[0] = -player.vel[0];
+        }
+        if (player.pos[1] > 95000.f || player.pos[1] < -95000.f) {
+          player.vel[1] = -player.vel[1];
+        }
+      }
+    }
 
     const auto begin = std::chrono::steady_clock::now();
     dispatcher.ExecuteTick(sink);
@@ -220,6 +417,9 @@ Result Run(size_t players, size_t workers, size_t maxShards,
         static_cast<double>(metrics.lastAggregateTaskMicros);
       out.workUnits = metrics.lastWorkUnitCount;
       out.relays = metrics.lastRelayEdgesEmitted;
+      out.clusters = metrics.lastClusterCount;
+      out.chunks = metrics.lastChunkCount;
+      out.largestCluster = metrics.lastLargestClusterSize;
     }
   }
 
@@ -473,6 +673,104 @@ int main(int argc, char** argv)
       printf("%9.2fx\n", join.medianMicros / workers.medianMicros);
     } else {
       printf("%10s\n", "-");
+    }
+  }
+
+  // The population a live test actually has: several cities at once, the rest
+  // of the map thinly occupied, and -- in the roaming shape -- parties walking
+  // between the two fast enough to change chunk every tick.
+  //
+  // Both arms are priced with the decline grounds forced off, for the reason
+  // the previous section gives: what the gate would decide is the question,
+  // so measuring only the populations it already agreed to would assume the
+  // answer.
+  Header("A live-test population, both paths priced with the gate forced");
+  printf("%10s %8s %11s %11s %8s %9s %8s %9s %10s\n", "shape", "players",
+         "inline us", "offload us", "ratio", "clusters", "chunks", "biggest",
+         "relays");
+  for (const Shape shape : { Shape::Province, Shape::Roaming }) {
+    for (size_t players : { size_t(100), size_t(200), size_t(400),
+                            size_t(800) }) {
+      const Result inlineRun =
+        Run(players, 0, 0, 0, ticks, warmup, /*forceInline=*/true, UINT32_MAX,
+            /*forceAccept=*/true, /*relayFromWorkers=*/false, shape);
+      const Result offload =
+        Run(players, 0, 0, 0, ticks, warmup, false, UINT32_MAX,
+            /*forceAccept=*/true, /*relayFromWorkers=*/false, shape);
+
+      printf("%10s %8zu ", ShapeName(shape), players);
+      if (inlineRun.declined) {
+        printf("%11s ", "declined");
+      } else {
+        printf("%11.1f ", inlineRun.medianMicros);
+      }
+      if (offload.declined) {
+        printf("%11s ", "declined");
+      } else {
+        printf("%11.1f ", offload.medianMicros);
+      }
+      if (!inlineRun.declined && !offload.declined &&
+          offload.medianMicros > 0.0) {
+        printf("%7.2fx ", inlineRun.medianMicros / offload.medianMicros);
+      } else {
+        printf("%8s ", "-");
+      }
+      printf("%9zu %8zu %9zu %10llu\n", offload.clusters, offload.chunks,
+             offload.largestCluster,
+             static_cast<unsigned long long>(offload.relays));
+    }
+  }
+
+  // What it costs to work out where everybody is.
+  //
+  // Partitioning is the one phase whose cost is driven by how *spread out* a
+  // population is rather than by how dense it is: it walks the occupied
+  // chunks and probes the window around each one. A crowd occupies a single
+  // chunk and the pass is free; a few hundred travellers occupy a few hundred
+  // chunks and it is not. That is the opposite of the workload the rest of
+  // this file measures, so it gets its own timing rather than being inferred
+  // from a tick.
+  Header("Partitioning alone, by occupied chunk count (separation 4)");
+  printf("%9s %9s %12s %12s %10s\n", "actors", "chunks", "us/partition",
+         "ns/chunk", "clusters");
+  {
+    AreaPartitioner partitioner;
+    std::vector<AreaCluster> clusters;
+    for (const size_t actorCount : { size_t(100), size_t(200), size_t(400),
+                                     size_t(800), size_t(1600) }) {
+      for (const bool spread : { false, true }) {
+        std::vector<ActorSnapshot> actors(actorCount);
+        Rng rng(0x1234abcdULL);
+        for (size_t i = 0; i < actorCount; ++i) {
+          // Either everyone in one chunk, or one chunk each: the two ends of
+          // the range a real map sits between.
+          const float x = spread ? rng.Float(-120000.f, 120000.f)
+                                 : static_cast<float>(i % 64) * 60.f;
+          const float y = spread ? rng.Float(-120000.f, 120000.f)
+                                 : static_cast<float>(i / 64) * 60.f;
+          actors[i].formId = 0xff000001 + static_cast<uint32_t>(i);
+          actors[i].currentPos[0] = x;
+          actors[i].currentPos[1] = y;
+          actors[i].worldOrCell = 0x3c;
+          actors[i].area = AreaKey{ 0x3c, ToChunkCoord(x), ToChunkCoord(y) };
+        }
+
+        std::vector<double> samples;
+        const int partitionRuns = 200;
+        for (int r = 0; r < partitionRuns; ++r) {
+          const auto begin = std::chrono::steady_clock::now();
+          partitioner.Partition(actors, 4, clusters);
+          const auto end = std::chrono::steady_clock::now();
+          samples.push_back(
+            std::chrono::duration<double, std::micro>(end - begin).count());
+        }
+        std::sort(samples.begin(), samples.end());
+        const double median = samples[samples.size() / 2];
+        const size_t chunkCount = partitioner.GetLastChunkCount();
+        printf("%9zu %9zu %12.2f %12.1f %10zu\n", actorCount, chunkCount,
+               median, median * 1000.0 / static_cast<double>(chunkCount),
+               clusters.size());
+      }
     }
   }
 
