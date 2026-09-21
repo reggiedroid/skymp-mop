@@ -207,6 +207,8 @@ Add a `parallelism` object to `server-settings.json`:
     "enabled": true,
     "workerThreads": 0,
     "minActorsToOffload": 100,
+    "adaptiveParallelism": true,
+    "minOffloadWorkMicros": 100,
     "minClusterActors": 4,
     "minShardActors": 4,
     "minShardMicros": 20,
@@ -216,7 +218,7 @@ Add a `parallelism` object to `server-settings.json`:
     "interestFullRateUnits": 2048,
     "maxInterestSkipTicks": 4,
     "adaptiveThrottling": true,
-    "targetTickBudgetMicros": 8000,
+    "targetTickBudgetMicros": 2000,
     "throttleDistanceUnits": 4096,
     "maxThrottleSkipTicks": 3,
     "metricsLogIntervalTicks": 0
@@ -241,13 +243,26 @@ Add a `parallelism` object to `server-settings.json`:
 | `clusterSeparationChunks` | `4` | Chunk distance separating clusters. Clamped up to 3. Raise it if you want more margin, at the cost of merging nearby crowds. |
 | `maxWorkUnitsPerTick` | `0` | `0` is unlimited. Units past the limit run on the calling thread. |
 | `adaptiveThrottling` | `true` | Enables the degradation described above. Only ever activates under measured overload. |
-| `targetTickBudgetMicros` | `8000` | Wall-clock target for the parallel phase. Overshooting raises pressure. |
-| `throttleDistanceUnits` | `4096` | Relays closer than this are never throttled. One exterior cell. |
+| `targetTickBudgetMicros` | `2000` | Wall-clock target for the parallel phase. Overshooting raises pressure. Twice what a whole tick has to give: the server loop is `tick(); sleep(1)`, so the previous `8000` meant no area was judged under pressure until the server was already catastrophically late. |
+| `throttleDistanceUnits` | `4096` | Base radius of the near band, which is never throttled. Halves per pressure level, so at the highest it is 512 units — still inside a fight. It never shrinks below an eighth of this value. |
 | `maxThrottleSkipTicks` | `3` | Hard ceiling on how far apart a throttled relay may be spaced. |
 | `metricsLogIntervalTicks` | `0` | `0` disables. Otherwise logs a summary line every N ticks. |
-| `adaptiveParallelism` | `false` | Raises the effective `minActorsToOffload` at run time when the pool is measurably not paying for itself. Off by default and **unmeasured** — no benchmark here shows it helping. |
-| `adaptiveBias` | `1.05` | How much slower than serial the offload may be before a tick counts against it. Only read when `adaptiveParallelism` is on. |
-| `adaptiveDecayTicks` | `10` | How often, in ticks, a raised threshold decays back toward `minActorsToOffload`, which is also its floor. |
+
+Deciding whether to offload at all. The dispatcher does not compare a statistic
+against a threshold: it periodically runs both paths and keeps whichever
+measured cheaper per mover. Declining is not the same as running the tick
+without the pool — it hands the tick back to `ActionListener`'s original
+relay-then-validate path, which is the real floor.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `adaptiveParallelism` | `true` | The paired A/B trial. Off makes the decision fall back to `minOffloadSpeedup`. |
+| `minOffloadWorkMicros` | `100` | Estimated work below which a tick is declined outright, without trialling. Cheap early-out for populations too small to be worth measuring. `0` never declines on this ground, which is how to get interest management unconditionally. |
+| `minOffloadSpeedup` | `2.5` | Achieved-speedup floor used only before any trial has reached a verdict. |
+| `adaptiveProbeIntervalTicks` | `240` | Ticks the gate may stay shut before taking one tick on to refresh its evidence. Everything the decision rests on is measured only on accepted ticks, so without this the gate cannot notice a crowd forming under it. `0` disables the probe. |
+| `abTrialIntervalTicks` | `1800` | Ticks between trials. |
+| `abTrialBlockTicks` | `4` | Ticks per arm per block. |
+| `abTrialBlocks` | `12` | Blocks per trial, split between the two arms. With the defaults a trial costs 48 ticks in 1800, half of them on whichever path turns out to be worse. |
 
 ### Suggested starting point
 
