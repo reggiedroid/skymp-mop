@@ -244,6 +244,27 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
     // measured and the comparison would have nothing to compare against.
     UpdateTrial();
     metrics.lastAttemptCount = lastAttemptCount;
+
+    // A declining server used to be silent. The summary line below this early
+    // return never ran, so an operator watching the log saw nothing at all --
+    // identical to the feature being switched off, and identical to an idle
+    // server. That is the one state a live test most needs to be able to see,
+    // because declining is a decision the gate makes on its own and the
+    // operator has no other way to learn it was made.
+    //
+    // Only when players actually tried to move. An empty tick on a quiet
+    // server is not a decision and should not fill the log with one.
+    if (lastAttemptCount > 0 && config.metricsLogIntervalTicks > 0 &&
+        snapshot.tickIndex % config.metricsLogIntervalTicks == 0) {
+      spdlog::info("MpParallel: tick={} declined attempts={} declinedTotal={} "
+                   "verdict={} ticksSinceAccept={}",
+                   metrics.lastTickIndex, lastAttemptCount,
+                   metrics.totalDeclinedTicks,
+                   abHasVerdict ? (abVerdictAccept ? "accept" : "decline")
+                                : "none",
+                   ticksSinceAccept);
+    }
+
     snapshot.Clear();
     return;
   }
@@ -275,12 +296,15 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
     spdlog::info(
       "MpParallel: tick={} actors={} clusters={} biggest={} units={} "
       "(pooled {}) relays={} throttled={} parallel={}us join={}us "
-      "speedup={:.2f}x",
+      "speedup={:.2f}x declinedTotal={} verdict={} relays_from={}",
       metrics.lastTickIndex, metrics.lastActorCount, metrics.lastClusterCount,
       metrics.lastLargestClusterSize, metrics.lastWorkUnitCount,
       metrics.lastPooledUnitCount, metrics.lastRelayEdgesEmitted,
       metrics.lastRelayEdgesThrottled, metrics.lastParallelMicros,
-      metrics.lastJoinMicros, metrics.GetLastSpeedup());
+      metrics.lastJoinMicros, metrics.GetLastSpeedup(),
+      metrics.totalDeclinedTicks,
+      abHasVerdict ? (abVerdictAccept ? "accept" : "decline") : "none",
+      config.relayFromWorkers ? "workers" : "join");
   }
 
   snapshot.Clear();
@@ -681,7 +705,7 @@ void OffloadDispatcher::RunUnits(IOffloadSink& sink)
         unit.count, pressureByCluster[unit.clusterIndex], policy,
         unitOutputs[unitIndex]);
       const ClusterOutput& output = unitOutputs[unitIndex];
-      if (!output.sends.empty()) {
+      if (config.relayFromWorkers && !output.sends.empty()) {
         sink.SendRelayBatch(output.sends.data(), output.sends.size(),
                             snapshot.rawPacketBytes.data(),
                             snapshot.rawPacketBytes.size());
@@ -741,7 +765,7 @@ void OffloadDispatcher::RunUnits(IOffloadSink& sink)
         u.count, pressureByCluster[u.clusterIndex], policy,
         unitOutputs[unitIndex]);
       const ClusterOutput& output = unitOutputs[unitIndex];
-      if (!output.sends.empty()) {
+      if (config.relayFromWorkers && !output.sends.empty()) {
         sink.SendRelayBatch(output.sends.data(), output.sends.size(),
                             snapshot.rawPacketBytes.data(),
                             snapshot.rawPacketBytes.size());
@@ -765,7 +789,7 @@ void OffloadDispatcher::RunUnits(IOffloadSink& sink)
       unit.count, pressureByCluster[unit.clusterIndex], policy,
       unitOutputs[unitIndex]);
     const ClusterOutput& output = unitOutputs[unitIndex];
-    if (!output.sends.empty()) {
+    if (config.relayFromWorkers && !output.sends.empty()) {
       sink.SendRelayBatch(output.sends.data(), output.sends.size(),
                           snapshot.rawPacketBytes.data(),
                           snapshot.rawPacketBytes.size());
@@ -782,6 +806,27 @@ void OffloadDispatcher::JoinResults(IOffloadSink& sink)
   const uint64_t joinStart = NowMicros();
 
   clusterMicros.assign(clusters.size(), 0);
+
+  // Relays first, and all of them, before any world write. That is the order
+  // the workers produce when relayFromWorkers is on -- every relay leaves
+  // during the parallel phase, which has finished before the join starts --
+  // so emitting them here in one pass keeps the two configurations
+  // equivalent rather than merely similar.
+  //
+  // A separate pass rather than one call inside the loop below, for the same
+  // reason: interleaving relays with ApplyMovement would put some of this
+  // tick's relays after some of this tick's world writes, which neither the
+  // worker path nor the original inline path does.
+  if (!config.relayFromWorkers) {
+    for (size_t unitIndex = 0; unitIndex < workUnits.size(); ++unitIndex) {
+      const ClusterOutput& output = unitOutputs[unitIndex];
+      if (!output.sends.empty()) {
+        sink.SendRelayBatch(output.sends.data(), output.sends.size(),
+                            snapshot.rawPacketBytes.data(),
+                            snapshot.rawPacketBytes.size());
+      }
+    }
+  }
 
   // Work-unit order: cluster index, then ascending member order within the
   // cluster. Both are fixed before any task starts, so the same inputs

@@ -6,6 +6,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+#include <string>
 #include <vector>
 
 using namespace MpParallel;
@@ -1002,6 +1005,154 @@ TEST_CASE("Adaptive tuning never changes what gets relayed",
   for (size_t i = 0; i < fixed.relays.size(); ++i) {
     REQUIRE(fixed.relays[i].userId == adaptive.relays[i].userId);
     REQUIRE(fixed.relays[i].bytes == adaptive.relays[i].bytes);
+  }
+}
+
+TEST_CASE("A declining server still says so in the log", "[ParallelOffload]")
+{
+  // A declined tick returns before the summary line, so a server declining
+  // everything logged nothing at all -- indistinguishable from the feature
+  // being switched off, and from an idle server. That is the state a live
+  // test most needs to be able to see, because declining is a decision the
+  // gate takes on its own.
+  auto ring = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
+  auto captured = std::make_shared<spdlog::logger>("parallel-test", ring);
+  captured->set_level(spdlog::level::info);
+  std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+  spdlog::set_default_logger(captured);
+
+  ParallelConfig config = MakeConfig(2, 1);
+  config.metricsLogIntervalTicks = 1;
+  // Nothing this population can do is ever worth offloading. The first tick
+  // still accepts, because the cost estimate has no sample yet; every tick
+  // after it has one and declines.
+  config.minOffloadWorkMicros = 100000000;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+  const std::vector<uint8_t> packet{ 1, 2, 3 };
+  const std::vector<RelayTarget> targets = MakeTargets(20);
+
+  // Driven through the caller contract rather than through DriveTicks,
+  // because the attempt count this line reports is maintained by
+  // WillAcceptThisTick and by nothing else. ActionListener asks before it
+  // builds a submission; a driver that skips the question is invisible to the
+  // gate's own bookkeeping, which is the distinction the line exists to show.
+  for (int tick = 0; tick < 12; ++tick) {
+    for (int i = 0; i < 20; ++i) {
+      if (dispatcher.WillAcceptThisTick()) {
+        dispatcher.SubmitMovement(
+          MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                         static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                         packet));
+      }
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+
+  spdlog::set_default_logger(previous);
+
+  bool sawDeclined = false;
+  for (const std::string& line : ring->last_formatted()) {
+    if (line.find("declined attempts=") != std::string::npos) {
+      sawDeclined = true;
+    }
+  }
+  REQUIRE(sawDeclined);
+}
+
+TEST_CASE("An idle server does not log a decline it never made",
+          "[ParallelOffload]")
+{
+  // The other half of the same rule. No movement arrived, so there was no
+  // decision, and a quiet server must not fill its log with one.
+  auto ring = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
+  auto captured = std::make_shared<spdlog::logger>("parallel-idle", ring);
+  captured->set_level(spdlog::level::info);
+  std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+  spdlog::set_default_logger(captured);
+
+  ParallelConfig config = MakeConfig(2, 1);
+  config.metricsLogIntervalTicks = 1;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+  for (int tick = 0; tick < 12; ++tick) {
+    dispatcher.ExecuteTick(sink);
+  }
+
+  spdlog::set_default_logger(previous);
+
+  for (const std::string& line : ring->last_formatted()) {
+    REQUIRE(line.find("declined attempts=") == std::string::npos);
+  }
+}
+
+TEST_CASE("Deferring relays to the join changes nothing but the thread",
+          "[ParallelOffload]")
+{
+  // relayFromWorkers is the switch an operator uses when the network stack's
+  // thread-safety under concurrent Send has not been confirmed on their
+  // build. It is allowed to cost time. It is not allowed to cost a packet,
+  // or to send one to somebody else.
+  const std::vector<uint8_t> packet{ 7, 7, 7 };
+  const std::vector<RelayTarget> targets = MakeTargets(40);
+
+  auto run = [&](bool fromWorkers, RecordingSink& sink) {
+    ParallelConfig config = MakeConfig(4, 1);
+    config.relayFromWorkers = fromWorkers;
+    config.Normalize();
+
+    OffloadDispatcher dispatcher(config);
+    DriveTicks(dispatcher, sink, 40, 20, packet, targets);
+  };
+
+  RecordingSink fromWorkers;
+  RecordingSink fromJoin;
+  run(true, fromWorkers);
+  run(false, fromJoin);
+
+  REQUIRE(fromJoin.relays.size() == fromWorkers.relays.size());
+  REQUIRE(fromJoin.relays.size() > 0);
+  REQUIRE(fromJoin.applied == fromWorkers.applied);
+
+  std::sort(fromWorkers.relays.begin(), fromWorkers.relays.end());
+  std::sort(fromJoin.relays.begin(), fromJoin.relays.end());
+  REQUIRE(fromJoin.relays == fromWorkers.relays);
+}
+
+TEST_CASE("Relays emitted from the join are in a deterministic order",
+          "[ParallelOffload]")
+{
+  // The property the worker path gave up. Two identical runs with
+  // relayFromWorkers off must produce the same sequence, not merely the same
+  // set -- that is most of the point of having the switch, since it is what
+  // makes a failure reproducible while a live test is being diagnosed.
+  const std::vector<uint8_t> packet{ 9, 9 };
+  const std::vector<RelayTarget> targets = MakeTargets(40);
+
+  auto run = [&](RecordingSink& sink) {
+    ParallelConfig config = MakeConfig(4, 1);
+    config.relayFromWorkers = false;
+    config.Normalize();
+
+    OffloadDispatcher dispatcher(config);
+    DriveTicks(dispatcher, sink, 40, 20, packet, targets);
+  };
+
+  RecordingSink first;
+  RecordingSink second;
+  run(first);
+  run(second);
+
+  REQUIRE(first.relays.size() > 0);
+  REQUIRE(first.relays.size() == second.relays.size());
+  for (size_t i = 0; i < first.relays.size(); ++i) {
+    REQUIRE(first.relays[i].userId == second.relays[i].userId);
+    REQUIRE(first.relays[i].bytes == second.relays[i].bytes);
   }
 }
 

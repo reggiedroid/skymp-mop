@@ -104,7 +104,7 @@ struct Result
 Result Run(size_t players, size_t workers, size_t maxShards,
            uint32_t minShardMicros, int ticks, int warmup,
            bool forceInline = false, uint32_t spinMicros = UINT32_MAX,
-           bool forceAccept = false)
+           bool forceAccept = false, bool relayFromWorkers = false)
 {
   ParallelConfig config;
   config.enabled = true;
@@ -127,6 +127,10 @@ Result Run(size_t players, size_t workers, size_t maxShards,
   // explains why a caller that does not report ingest time makes the trial
   // decline unconditionally.
   config.adaptiveParallelism = false;
+
+  // Defaults to the shipped value, false, so every sweep above measures what
+  // an operator actually gets. The last section compares the two.
+  config.relayFromWorkers = relayFromWorkers;
 
   // Both decline grounds switched off, which is what the documented
   // `minOffloadWorkMicros: 0` is for. Used to price the offloaded path on a
@@ -429,6 +433,46 @@ int main(int argc, char** argv)
       printf("%10s %11.2fx\n", cheaper, ratio);
     } else {
       printf("%10s %12s\n", cheaper, "-");
+    }
+  }
+
+  // What the safe default costs.
+  //
+  // relayFromWorkers defaults to false because nothing in this tree
+  // establishes that slikenet's RakPeer::Send may be called from several
+  // threads at once, and being wrong about that corrupts a live server. The
+  // price of that caution belongs in a table rather than in a claim, so that
+  // an operator who has confirmed their network stack can see exactly what
+  // flipping it back is worth.
+  //
+  // Both columns do identical work and emit identical relays -- that much is
+  // pinned by `Deferring relays to the join changes nothing but the thread`
+  // in the unit suite. The only difference is which thread calls the sink.
+  Header("Relay dispatch: from workers vs deferred to the join");
+  printf("%9s %14s %14s %10s\n", "players", "join (default)", "workers",
+         "cost");
+  for (size_t players : { size_t(100), size_t(200), size_t(400) }) {
+    const Result join = Run(players, 0, 0, 0, ticks, warmup, false, UINT32_MAX,
+                            /*forceAccept=*/true, /*relayFromWorkers=*/false);
+    const Result workers = Run(players, 0, 0, 0, ticks, warmup, false,
+                               UINT32_MAX, /*forceAccept=*/true,
+                               /*relayFromWorkers=*/true);
+
+    printf("%9zu ", players);
+    if (join.declined) {
+      printf("%14s ", "declined");
+    } else {
+      printf("%14.1f ", join.medianMicros);
+    }
+    if (workers.declined) {
+      printf("%14s ", "declined");
+    } else {
+      printf("%14.1f ", workers.medianMicros);
+    }
+    if (!join.declined && !workers.declined && workers.medianMicros > 0.0) {
+      printf("%9.2fx\n", join.medianMicros / workers.medianMicros);
+    } else {
+      printf("%10s\n", "-");
     }
   }
 

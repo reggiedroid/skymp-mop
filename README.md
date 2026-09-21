@@ -209,6 +209,7 @@ Add a `parallelism` object to `server-settings.json`:
     "minActorsToOffload": 100,
     "adaptiveParallelism": true,
     "minOffloadWorkMicros": 100,
+    "relayFromWorkers": false,
     "minClusterActors": 4,
     "minShardActors": 4,
     "minShardMicros": 20,
@@ -240,6 +241,7 @@ Add a `parallelism` object to `server-settings.json`:
 | `maxShardsPerCluster` | `0` | `0` auto-sizes to twice the slot count. Raise only if profiling shows one area still bottlenecking. |
 | `minShardMicros` | `20` | Smallest estimated work, in µs, that justifies its own shard. A quiet tick collapses to one unit and skips the barrier. Raising it starves the unit count: 95 cost 25% and 150 cost 53% in `misc/parallel_bench`. |
 | `workerSpinMicros` | `250` | How long a worker spins on the cursor before parking. Measured well chosen — dropping it to 0 cost 18–93% at every pool size tried. |
+| `relayFromWorkers` | `false` | Whether workers hand relays straight to the send target, or leave them for the join thread. **`true` requires a network stack that tolerates `Send` from several threads at once**, which nothing in this repository establishes for slikenet, so the default is the safe one. Costs roughly 1.3× at 100 players, 1.4–1.7× at 200 and ~1.5× at 400 of `ExecuteTick` — and the offload still beats inline by about 3.8× at 400 with it off. Identical relays either way; see *Live testing* below. |
 | `clusterSeparationChunks` | `4` | Chunk distance separating clusters. Clamped up to 3. Raise it if you want more margin, at the cost of merging nearby crowds. |
 | `maxWorkUnitsPerTick` | `0` | `0` is unlimited. Units past the limit run on the calling thread. |
 | `adaptiveThrottling` | `true` | Enables the degradation described above. Only ever activates under measured overload. |
@@ -282,7 +284,19 @@ Watch the log line, then tune:
 ```
 MpParallel: tick=5000 actors=214 clusters=37 biggest=151 units=58 (pooled 54)
             relays=9871 throttled=0 parallel=2104us join=610us speedup=6.31x
+            declinedTotal=412 verdict=accept relays_from=join
 ```
+
+A tick the gate declined prints a shorter line instead, and only when players
+were actually trying to move:
+
+```
+MpParallel: tick=5000 declined attempts=180 declinedTotal=4998
+            verdict=decline ticksSinceAccept=237
+```
+
+Seeing that line is the point of it. A server that declines every tick used to
+log nothing at all, which looks exactly like the feature being switched off.
 
 - `speedup` is summed task time over wall-clock parallel time. Near 1 means the
   offload is buying nothing — usually because `minActorsToOffload` is never
@@ -291,7 +305,51 @@ MpParallel: tick=5000 actors=214 clusters=37 biggest=151 units=58 (pooled 54)
   `biggest` is most of `actors`, sharding is doing the work, and `units` should
   be comfortably larger than `clusters`. If it is not, lower `minShardActors`.
 - `join` growing toward `parallel` means the serial tail is becoming the limit;
-  more cores will not help past that point.
+  more cores will not help past that point. With the default
+  `relayFromWorkers: false` the join *also* carries every relay, so a large
+  `join` is expected and is not by itself evidence of a serial bottleneck.
+  Compare the two settings before concluding anything from it.
+
+### Live testing
+
+The whole subsystem is off unless `enabled` is set, so a live test is opt-in
+and the kill switch is the same setting. `Reconfigure` picks up a changed
+worker count between ticks, and setting `enabled: false` returns the server to
+the original code path byte for byte.
+
+Start here, and change one thing at a time:
+
+```json5
+"parallelism": {
+  "enabled": true,
+  "workerThreads": 0,
+  "relayFromWorkers": false,
+  "metricsLogIntervalTicks": 5000
+}
+```
+
+1. **Leave `relayFromWorkers` at `false` for the first run.** With it off, no
+   worker thread touches the send target at all: relays are emitted from the
+   join, one thread, in work-unit order. That also makes a failure
+   reproducible, which a concurrent path does not.
+2. **Watch `verdict` and `declinedTotal` in the metrics line.** The offload
+   decides whether to engage by measuring both paths, and `verdict=decline`
+   with a climbing `declinedTotal` means it chose not to. If that happens on a
+   population you expected it to take on, that is the thing to report, not a
+   setting to override. `minOffloadWorkMicros: 0` forces it to engage and is
+   the way to get a comparison, not a way to run a server.
+3. **Only then consider `relayFromWorkers: true`**, and only if you have
+   established that your build's send path tolerates concurrent `Send`. On
+   this tree that means slikenet's `RakPeer::Send`, which is a vcpkg
+   dependency and was not inspected here. Everything else on that path was:
+   the connected-user bitmap is built before the tick and only read during it,
+   `PartOne::GetSendTarget` is a const accessor, and `IdManager::find` is a
+   bounds-checked vector read whose mutators run in a different phase of the
+   main thread.
+
+What it is worth: about 1.5× of `ExecuteTick` at 400 players. What it costs if
+the assumption is wrong: memory corruption in a running server. That is the
+trade, stated so it can be made deliberately.
 
 ## One deliberate behavioural difference
 

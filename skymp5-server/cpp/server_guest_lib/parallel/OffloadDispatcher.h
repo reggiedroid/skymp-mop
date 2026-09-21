@@ -76,6 +76,15 @@ public:
   // `sends` index into [packetBytes, packetBytes + packetBytesLength). The
   // implementation must bounds-check them; a range that does not fit is a
   // malformed submission and should be skipped, not clamped.
+  //
+  // THREADING: called concurrently from every worker thread when
+  // config.relayFromWorkers is set, and from the joining thread alone when it
+  // is not. An implementation that keeps any mutable state -- a counter, a
+  // vector it appends to -- must synchronise it, and must not assume the
+  // single-threaded ordering the other two methods get. Getting this wrong is
+  // not theoretical: it is what made the unit suite's RecordingSink corrupt
+  // the heap, because it was written against the older contract where the
+  // join emitted every relay.
   virtual void SendRelayBatch(const OutboundSend* sends, size_t count,
                               const uint8_t* packetBytes,
                               size_t packetBytesLength) = 0;
@@ -87,8 +96,17 @@ public:
 //
 // Threading contract: every public method is main-thread only and none may be
 // called while ExecuteTick is running. Worker threads exist solely inside
-// ExecuteTick and touch nothing but the snapshot (read) and the one
-// ClusterOutput belonging to their work unit (write).
+// ExecuteTick and touch nothing but the snapshot (read), the one
+// ClusterOutput belonging to their work unit (write), and -- only when
+// config.relayFromWorkers is set -- the sink's SendRelayBatch.
+//
+// That exception is worth stating plainly, because it is the one place this
+// class reaches outside itself on a thread the caller did not create. With
+// relayFromWorkers on, SendRelayBatch is called concurrently from every
+// worker and every implementation of it must be thread-safe. ApplyMovement
+// and SendCorrection never are: both are called only from the joining thread.
+// With relayFromWorkers off, no IOffloadSink method is called from a worker
+// at all.
 class OffloadDispatcher
 {
 public:

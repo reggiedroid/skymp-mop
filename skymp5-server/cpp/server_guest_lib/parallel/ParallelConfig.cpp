@@ -228,6 +228,8 @@ ParallelConfig ParallelConfig::FromServerSettings(
     ReadNumber<uint32_t>(j, "minShardMicros", config.minShardMicros);
   config.workerSpinMicros =
     ReadNumber<uint32_t>(j, "workerSpinMicros", config.workerSpinMicros);
+  config.relayFromWorkers =
+    ReadBool(j, "relayFromWorkers", config.relayFromWorkers);
   config.targetTickBudgetMicros = ReadNumber<uint64_t>(
     j, "targetTickBudgetMicros", config.targetTickBudgetMicros);
   config.throttleDistanceUnits =

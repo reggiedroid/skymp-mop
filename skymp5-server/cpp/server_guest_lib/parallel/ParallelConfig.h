@@ -325,6 +325,38 @@ struct ParallelConfig
   // bridge; see ThreadPool.h. 0 disables spinning entirely.
   uint32_t workerSpinMicros = kDefaultSpinMicros;
 
+  // Whether worker threads hand their relays straight to the sink, or leave
+  // them for the join thread to emit.
+  //
+  // True is faster, and is what the measured figures were taken with: the
+  // join drops from tens of microseconds to under two, because the relays no
+  // longer queue behind it. It also means IOffloadSink::SendRelayBatch is
+  // called concurrently, so every implementation of that method must be
+  // thread-safe -- including, on a live server, whatever the send target
+  // ultimately calls.
+  //
+  // False keeps the whole parallel computation -- partitioning, interest
+  // management, throttling -- on the workers and moves only the sends back to
+  // the join, where they are emitted in work-unit order on one thread.
+  //
+  // Defaults to false deliberately, and this is a safety choice rather than a
+  // performance one. skymp5-server reaches slikenet's RakPeer::Send through
+  // PartOneSendTargetWrapper, and slikenet is a vcpkg dependency that is not
+  // part of this tree, so nothing in this repository establishes that calling
+  // it from several threads at once is safe. Everything on that path that
+  // *is* in this tree was checked and is safe to read concurrently:
+  // PartOneOffloadSink::connectedBits is built in BeginJoin and only read
+  // during the tick, PartOne::GetSendTarget is a const accessor, and
+  // IdManager::find(userid) is a bounds-checked vector read whose mutators
+  // run in a different main-thread phase. RakPeer::Send is the one link that
+  // could not be inspected.
+  //
+  // Being wrong about that corrupts a running server. Being conservative
+  // costs throughput that one setting recovers once the question is settled;
+  // the cost is measured in misc/parallel_bench/README.md rather than
+  // assumed.
+  bool relayFromWorkers = false;
+
   // Resolves workerThreads==0 to a concrete count and clamps every field to
   // its documented range. Idempotent.
   void Normalize();
