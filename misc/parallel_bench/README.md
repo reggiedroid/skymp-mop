@@ -37,8 +37,48 @@ So:
 - **Ratios between configurations are the point.**
 - **One machine is one machine.** Nothing here may become a shipped default on
   its own.
+- **A declined tick is not a fast tick.** Under the A/B-trial gate, declining
+  means the dispatcher takes nothing on and the work belongs to
+  `ActionListener`, which this harness does not have. `ExecuteTick` then
+  returns immediately. Such a point prints as `declined`, never as a number,
+  and no ratio is formed against it.
+- **This harness cannot judge the gate's own decision.** `UpdateTrial` prices
+  a tick as `ingestNanosThisTick + lastParallelMicros + lastJoinMicros`. On a
+  declined tick the last two are zero, so the cost is entirely what the caller
+  reported through `AddIngestNanos` — and a caller that does not implement
+  `WillAcceptThisTick` / `IsMeasuringThisTick` / `AddIngestNanos` reports
+  nothing. The declined arm then costs zero per mover, nothing can beat zero,
+  and the trial declines unconditionally. This file is such a caller.
+  `ActionListener` implements the contract, so `unit/ParallelBenchmark.cpp` is
+  where the gate can be judged. Anything this harness printed about engagement
+  would be a property of the harness.
+
+The last section, `Both paths priced with the gate forced`, exists because of
+the first point: it switches off both decline grounds so the offloaded path
+has a price even on a population the gate refuses, and prices the inline arm
+the same way. Without it the comparison could only ever see populations the
+gate had already agreed to, which assumes the answer.
+
+Read that section over several runs, not one. Four consecutive runs on the
+machine below put the offload ahead at 400 players every time (4.28×, 4.29×,
+5.12×, 4.57×) and at 200 players every time but by a margin that moved a lot
+(2.84×, 1.75×, 5.06×, 5.13×), while at 100 players they did not agree on the
+direction at all (0.77×, 0.81×, 1.96×, 1.96×). The absolute numbers moved with
+them — the inline arm at 200 players ranged from 287.8µs to 491.6µs — so that
+is the machine, not the code. Note that this is a much wider spread than the
+3–8% recorded for the tables below; those were taken on an otherwise idle
+host, and these were not.
 
 ## Results, 2026-09-21
+
+> **Measured against the dispatcher at `31209880`, before the A/B trial
+> replaced the threshold controller.** The tables below have *not* been
+> re-measured since. They are kept because the conclusions they draw about
+> pool sizing, shard budget and spin are about the thread pool, which did not
+> change — but the `vs inline` ratios are not reproducible as printed on a
+> build carrying the trial, where 100 players is declined outright rather than
+> run inline. Re-measuring them needs `./unit/unit "[ParallelBench]"`, which
+> needs the vcpkg tree.
 
 AMD Ryzen 9 PRO 8945HS, 8 physical cores / 16 threads, Linux 6.x, g++ 13.3,
 `-O2`. 400 timed ticks per point after 40 warm-up ticks, median of
