@@ -29,6 +29,15 @@ struct ParallelMetrics
   uint64_t lastRelayEdgesThrottled = 0;
   uint64_t lastRejectedMovements = 0;
 
+  // Submissions whose actor had gone by the time the join ran, this tick.
+  //
+  // Written by PartOne after ExecuteTick returns, not by the dispatcher: only
+  // the sink knows whether a form id still resolves. A submission is made
+  // while packets are still being pumped, and the actor can be destroyed or
+  // its owner disconnect before the join, so a few of these during churn are
+  // expected. A count that climbs on a steady population is not.
+  uint64_t lastStaleActors = 0;
+
   // Wall clock of the fork/join phase itself.
   uint64_t lastParallelMicros = 0;
   // Wall clock of the serial join that follows it.
@@ -73,6 +82,10 @@ struct ParallelMetrics
   uint64_t totalRelayEdgesThrottled = 0;
   uint64_t totalFailedTasks = 0;
 
+  // Running total of the above. Mirrors PartOneOffloadSink's own counter, and
+  // is the one an operator should watch across a session.
+  uint64_t totalStaleActors = 0;
+
   // Ratio of aggregate task time to wall-clock parallel time. 1.0 means the
   // offload bought nothing; the theoretical ceiling is the slot count.
   [[nodiscard]] double GetLastSpeedup() const noexcept
@@ -105,6 +118,9 @@ struct ParallelMetrics
     lastRelayEdgesEmitted = 0;
     lastRelayEdgesThrottled = 0;
     lastRejectedMovements = 0;
+    // Set after ExecuteTick returns, so clearing it here is what makes it a
+    // per-tick figure rather than the last non-zero one.
+    lastStaleActors = 0;
     lastParallelMicros = 0;
     lastJoinMicros = 0;
     lastAggregateTaskMicros = 0;

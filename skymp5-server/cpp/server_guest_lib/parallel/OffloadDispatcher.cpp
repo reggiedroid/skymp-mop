@@ -294,17 +294,22 @@ void OffloadDispatcher::ExecuteTick(IOffloadSink& sink)
   if (config.metricsLogIntervalTicks > 0 &&
       snapshot.tickIndex % config.metricsLogIntervalTicks == 0) {
     spdlog::info(
-      "MpParallel: tick={} actors={} clusters={} biggest={} units={} "
-      "(pooled {}) relays={} throttled={} parallel={}us join={}us "
-      "speedup={:.2f}x declinedTotal={} verdict={} relays_from={}",
+      "MpParallel: tick={} actors={} clusters={} biggest={} chunks={} "
+      "units={} (pooled {}) relays={} throttled={} parallel={}us join={}us "
+      "speedup={:.2f}x declinedTotal={} verdict={} relays_from={} "
+      "staleTotal={}",
       metrics.lastTickIndex, metrics.lastActorCount, metrics.lastClusterCount,
-      metrics.lastLargestClusterSize, metrics.lastWorkUnitCount,
-      metrics.lastPooledUnitCount, metrics.lastRelayEdgesEmitted,
-      metrics.lastRelayEdgesThrottled, metrics.lastParallelMicros,
-      metrics.lastJoinMicros, metrics.GetLastSpeedup(),
-      metrics.totalDeclinedTicks,
+      metrics.lastLargestClusterSize, metrics.lastChunkCount,
+      metrics.lastWorkUnitCount, metrics.lastPooledUnitCount,
+      metrics.lastRelayEdgesEmitted, metrics.lastRelayEdgesThrottled,
+      metrics.lastParallelMicros, metrics.lastJoinMicros,
+      metrics.GetLastSpeedup(), metrics.totalDeclinedTicks,
       abHasVerdict ? (abVerdictAccept ? "accept" : "decline") : "none",
-      config.relayFromWorkers ? "workers" : "join");
+      config.relayFromWorkers ? "workers" : "join",
+      // Written by PartOne after the previous ExecuteTick returned, so this
+      // is the total as of the last join. Cumulative, so the lag does not
+      // matter; what an operator watches is whether it grows.
+      metrics.totalStaleActors);
   }
 
   snapshot.Clear();
