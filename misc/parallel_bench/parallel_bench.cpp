@@ -88,6 +88,15 @@ struct Result
   double speedup = 0.0;
   size_t workUnits = 0;
   uint64_t relays = 0;
+
+  // No timed tick took any work on. The dispatcher declined, which under the
+  // A/B-trial gate means the tick's work belongs to ActionListener and never
+  // reaches ExecuteTick at all -- so every number above is the cost of doing
+  // nothing, and a ratio taken against one is meaningless. This harness has
+  // no inline path of its own, so a declined point is not a measurement and
+  // must not be printed as one.
+  bool declined = false;
+  uint64_t acceptedSubmissions = 0;
 };
 
 // Every player in one chunk, every player moving every tick: the N^2 relay
@@ -168,7 +177,13 @@ Result Run(size_t players, size_t workers, size_t maxShards,
       submission.isStanding = true;
       submission.packetData = packet.data();
       submission.packetLength = packet.size();
-      dispatcher.SubmitMovement(submission);
+      // The return value is the gate's answer. False means the caller is
+      // expected to handle this update itself, so counting these is the only
+      // way to tell a fast tick from a tick that never happened.
+      const bool takenOn = dispatcher.SubmitMovement(submission);
+      if (takenOn && tick >= warmup) {
+        ++out.acceptedSubmissions;
+      }
     }
     dispatcher.SetPotentialTargets(std::move(targets));
 
@@ -191,6 +206,8 @@ Result Run(size_t players, size_t workers, size_t maxShards,
     }
   }
 
+  out.declined = out.acceptedSubmissions == 0;
+
   std::sort(samples.begin(), samples.end());
   out.medianMicros = samples[samples.size() / 2];
   out.p90Micros = samples[static_cast<size_t>(samples.size() * 0.9)];
@@ -210,6 +227,17 @@ void Header(const char* title)
     putchar('-');
   }
   putchar('\n');
+}
+
+// One median cell. A declined point prints as such rather than as 0.0, which
+// is what it would otherwise read as: ExecuteTick returning immediately.
+void MedianCell(const Result& r, int width)
+{
+  if (r.declined) {
+    printf("%*s", width, "declined");
+  } else {
+    printf("%*.1f", width, r.medianMicros);
+  }
 }
 
 }
@@ -237,23 +265,45 @@ int main(int argc, char** argv)
     printf("%8s %11s %10s %10s %9s %10s %8s %7s\n", "workers", "median us",
            "p90 us", "parallel", "join", "aggregate", "speedup", "units");
 
+    // Raising minActorsToOffload out of reach used to produce an inline run,
+    // because the dispatcher did the work on the calling thread. Under the
+    // A/B-trial gate it produces a *declined* run instead, and the work moves
+    // to ActionListener, which this harness does not have. When that happens
+    // there is no baseline here and no ratio can be formed against one.
     const Result inlineRun =
       Run(players, 0, 0, 0, ticks, warmup, /*forceInline=*/true);
-    printf("%8s %11.1f %10.1f %10.1f %9.1f %10.1f %7.2fx %7zu   (baseline)\n",
-           "inline", inlineRun.medianMicros, inlineRun.p90Micros,
-           inlineRun.parallelMicros, inlineRun.joinMicros,
-           inlineRun.aggregateMicros, inlineRun.speedup, inlineRun.workUnits);
+    if (inlineRun.declined) {
+      printf("%8s %11s %10s %10s %9s %10s %8s %7s   (declined: no inline "
+             "baseline on this build)\n",
+             "inline", "-", "-", "-", "-", "-", "-", "-");
+    } else {
+      printf("%8s %11.1f %10.1f %10.1f %9.1f %10.1f %7.2fx %7zu   (baseline)\n",
+             "inline", inlineRun.medianMicros, inlineRun.p90Micros,
+             inlineRun.parallelMicros, inlineRun.joinMicros,
+             inlineRun.aggregateMicros, inlineRun.speedup, inlineRun.workUnits);
+    }
 
     for (size_t workers : { size_t(0), size_t(1), size_t(2), size_t(3),
                             size_t(4), size_t(6), size_t(7), size_t(8),
                             size_t(10), size_t(12), size_t(16), size_t(24),
                             size_t(32) }) {
       const Result r = Run(players, workers, 0, 0, ticks, warmup);
+      const char* autoMark = workers == 0 ? "   <- auto" : "";
+      if (r.declined) {
+        printf("%8zu %11s %10s %10s %9s %10s %8s %7s   %s%s\n", workers, "-",
+               "-", "-", "-", "-", "-", "-", "gate declined every tick",
+               autoMark);
+        continue;
+      }
       printf("%8zu %11.1f %10.1f %10.1f %9.1f %10.1f %7.2fx %7zu", workers,
              r.medianMicros, r.p90Micros, r.parallelMicros, r.joinMicros,
              r.aggregateMicros, r.speedup, r.workUnits);
-      printf("   %5.2fx vs inline%s\n", inlineRun.medianMicros / r.medianMicros,
-             workers == 0 ? "   <- auto" : "");
+      if (inlineRun.declined) {
+        printf("   %s%s\n", "(no baseline)", autoMark);
+      } else {
+        printf("   %5.2fx vs inline%s\n",
+               inlineRun.medianMicros / r.medianMicros, autoMark);
+      }
     }
   }
 
@@ -271,7 +321,8 @@ int main(int argc, char** argv)
     printf("%10zu", pool);
     for (size_t units : pinnedUnits) {
       const Result r = Run(400, pool, units, 0, ticks, warmup);
-      printf("%9.1f (%2zu)", r.medianMicros, r.workUnits);
+      MedianCell(r, 9);
+      printf(" (%2zu)", r.workUnits);
     }
     putchar('\n');
   }
@@ -285,7 +336,7 @@ int main(int argc, char** argv)
     printf("%10zu", pool);
     for (uint32_t spin : { 250u, 50u, 10u, 0u }) {
       const Result r = Run(400, pool, 32, 0, ticks, warmup, false, spin);
-      printf("%12.1f", r.medianMicros);
+      MedianCell(r, 12);
     }
     putchar('\n');
   }
@@ -295,6 +346,10 @@ int main(int argc, char** argv)
          "speedup", "units");
   for (uint32_t micros : { 10u, 20u, 30u, 40u, 60u, 95u, 150u }) {
     const Result r = Run(400, 8, 0, micros, ticks, warmup);
+    if (r.declined) {
+      printf("%10u %11s %10s %8s %7s\n", micros, "declined", "-", "-", "-");
+      continue;
+    }
     printf("%10u %11.1f %10.1f %7.2fx %7zu\n", micros, r.medianMicros,
            r.p90Micros, r.speedup, r.workUnits);
   }
