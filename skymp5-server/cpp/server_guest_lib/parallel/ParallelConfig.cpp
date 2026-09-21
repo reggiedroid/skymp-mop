@@ -1,20 +1,59 @@
 #include "ParallelConfig.h"
 
+#include "CoreCount.h"
 #include <algorithm>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
-#include <thread>
 
 namespace MpParallel {
 
 namespace {
 
-// Number of cores deliberately left to other threads: the Node/V8 main
-// thread that drives ScampServer::Tick, and Viet's async save-storage
-// thread. Oversubscribing them is what turns a throughput win into a
-// latency regression.
-constexpr size_t kReservedCores = 2;
+// Ceiling on the *auto-detected* worker count. An explicit workerThreads in
+// server-settings.json is only bounded by kMaxWorkerThreads.
+//
+// This bounds two things at once, and the second is the one that matters.
+//
+// What actually decides the tick cost is how many workers a tick *involves*,
+// which is the work-unit count, not how many threads exist. Measured by the
+// `Idle threads` case on a 16-core/32-thread Ryzen 9950X3D at 400 players in
+// one area, us/tick with the unit count pinned so only pool size varies:
+//
+//     pool size    4 units   8 units   16 units
+//     4              622       610       615
+//     8              628       544       551
+//     16             628       547       583
+//     24             627       550       572
+//
+// Down a column, 8 workers to 24 costs about 1%. Across a row, 4 units to 8 is
+// worth 12%. Surplus threads park in the condition variable and are nearly
+// free; at 150 players the residual is larger, around 10%, but still far below
+// what the unit count is worth.
+//
+// So the cap earns its keep indirectly: the auto shard budget ceiling is
+// `slots * 2`, so capping the pool at 8 caps the auto-sized unit count at 18,
+// which measured at or near the optimum for every population tried. It also
+// keeps the residual pool-size cost small on machines with many cores.
+//
+// An earlier version of this comment claimed the fall-off past 8 was cache
+// topology (two 8-core chiplets with separate L3). That was wrong: the
+// evidence cited for it was measured before the wake-accounting fix in the
+// same change, where Run re-woke workers Prime had already woken, so the
+// large-pool figure was paying surplus thread wakeups rather than cross-die
+// transfers. With the unit count pinned there is no such cliff.
+//
+// A later change raised this to 32, citing a projection model. That has been
+// reverted. The model caps its own worker search at 8, and its only
+// worker-count penalty is a flat per-shard constant, so it cannot produce a
+// fall-off and cannot be evidence that there is none. The measurements above
+// are the evidence that exists, and they argue the other way: with the pool at
+// 24, going from 8 units to 16 costs 4%, and the auto shard ceiling is
+// slots * 2, so a cap of 32 would auto-size up to 64 units.
+//
+// Operators on other hardware should run the benchmark and set workerThreads
+// explicitly.
+constexpr size_t kMaxAutoWorkerThreads = 8;
 
 template <typename T>
 T ReadNumber(const nlohmann::json& obj, const char* key, T fallback)
@@ -48,8 +87,12 @@ bool ReadBool(const nlohmann::json& obj, const char* key, bool fallback)
 void ParallelConfig::Normalize()
 {
   if (workerThreads == 0) {
-    const size_t detected = std::thread::hardware_concurrency();
-    workerThreads = detected > kReservedCores ? detected - kReservedCores : 1;
+    // Physical cores, bounded by what this process may actually run on
+    // (see CoreCount.h). One of them is left for the Node/V8 thread that
+    // drives ScampServer::Tick.
+    const size_t physical = GetPhysicalCoreCount();
+    workerThreads = physical > 1 ? physical - 1 : 1;
+    workerThreads = std::min(workerThreads, kMaxAutoWorkerThreads);
   }
   workerThreads = std::min(workerThreads, kMaxWorkerThreads);
   workerThreads = std::max<size_t>(workerThreads, 1);
@@ -60,6 +103,18 @@ void ParallelConfig::Normalize()
   minClusterActors = std::max<size_t>(minClusterActors, 1);
   minActorsToOffload = std::max<size_t>(minActorsToOffload, 1);
   minShardActors = std::max<size_t>(minShardActors, 1);
+  minShardMicros = std::max<uint32_t>(minShardMicros, 1);
+
+  // A spin longer than the tick period would keep every worker on a core for
+  // the whole frame, which is the failure mode this is meant to avoid.
+  workerSpinMicros = std::min<uint32_t>(workerSpinMicros, 5000);
+
+  // Prevent division-by-zero in the adaptive decay modulo check.
+  adaptiveDecayTicks = std::max<uint32_t>(adaptiveDecayTicks, 1);
+  // A bias below 1.0 would demand the offload beat serial execution on a
+  // machine where the two are within noise of each other, so every tick would
+  // count against the pool and the threshold would ratchet up for good.
+  adaptiveBias = std::max(adaptiveBias, 1.0f);
 
   if (targetTickBudgetMicros == 0) {
     targetTickBudgetMicros = 8000;
@@ -91,6 +146,12 @@ ParallelConfig ParallelConfig::FromServerSettings(
   const nlohmann::json& j = *it;
 
   config.enabled = ReadBool(j, "enabled", config.enabled);
+  config.adaptiveParallelism =
+    ReadBool(j, "adaptiveParallelism", config.adaptiveParallelism);
+  config.adaptiveBias =
+    ReadNumber<float>(j, "adaptiveBias", config.adaptiveBias);
+  config.adaptiveDecayTicks =
+    ReadNumber<uint32_t>(j, "adaptiveDecayTicks", config.adaptiveDecayTicks);
   config.adaptiveThrottling =
     ReadBool(j, "adaptiveThrottling", config.adaptiveThrottling);
   config.interestManagement =
@@ -114,8 +175,10 @@ ParallelConfig ParallelConfig::FromServerSettings(
     j, "clusterSeparationChunks", config.clusterSeparationChunks);
   config.maxWorkUnitsPerTick =
     ReadNumber<size_t>(j, "maxWorkUnitsPerTick", config.maxWorkUnitsPerTick);
-  config.repartitionIntervalTicks = ReadNumber<uint32_t>(
-    j, "repartitionIntervalTicks", config.repartitionIntervalTicks);
+  config.minShardMicros =
+    ReadNumber<uint32_t>(j, "minShardMicros", config.minShardMicros);
+  config.workerSpinMicros =
+    ReadNumber<uint32_t>(j, "workerSpinMicros", config.workerSpinMicros);
   config.targetTickBudgetMicros = ReadNumber<uint64_t>(
     j, "targetTickBudgetMicros", config.targetTickBudgetMicros);
   config.throttleDistanceUnits =
@@ -136,10 +199,13 @@ std::string ParallelConfig::Describe() const
   }
   return fmt::format(
     "parallel area offload: enabled, workerThreads={}, "
-    "minActorsToOffload={}, minClusterActors={}, minShardActors={}, "
-    "separation={} chunks, interestManagement={} (fullRate={}u, maxSkip={}), "
+    "minActorsToOffload={}, adaptiveParallelism={}, minClusterActors={}, "
+    "minShardActors={}, "
+    "minShardMicros={}, spin={}us, separation={} chunks, "
+    "interestManagement={} (fullRate={}u, maxSkip={}), "
     "adaptiveThrottling={}, budget={}us",
-    workerThreads, minActorsToOffload, minClusterActors, minShardActors,
+    workerThreads, minActorsToOffload, adaptiveParallelism ? "on" : "off",
+    minClusterActors, minShardActors, minShardMicros, workerSpinMicros,
     clusterSeparationChunks, interestManagement ? "on" : "off",
     interestFullRateUnits, maxInterestSkipTicks,
     adaptiveThrottling ? "on" : "off", targetTickBudgetMicros);

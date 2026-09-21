@@ -116,7 +116,8 @@ MpParallel::ParallelConfig MakeConfig(size_t workers)
 }
 
 Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
-                   bool useJson = false, bool interestMgmt = false)
+                   bool useJson = false, bool interestMgmt = false,
+                   uint32_t minShardMicros = 0, size_t maxShards = 0)
 {
   PartOne partOne;
   NullSendTarget sendTarget;
@@ -125,6 +126,12 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
   if (parallel) {
     MpParallel::ParallelConfig config = MakeConfig(workers);
     config.interestManagement = interestMgmt;
+    if (minShardMicros > 0) {
+      config.minShardMicros = minShardMicros;
+    }
+    if (maxShards > 0) {
+      config.maxShardsPerCluster = maxShards;
+    }
     config.Normalize();
     partOne.ConfigureParallelism(config);
   }
@@ -173,9 +180,25 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
   }
 
   sendTarget.sendCount = 0;
+
+  // The phase counters are per-tick and get overwritten, so they are summed
+  // as we go. Reading a handful of uint64s per tick is nothing against a tick
+  // measured in hundreds of microseconds, and the alternative -- reporting
+  // the last tick's breakdown against an averaged tick time -- produced
+  // impossible numbers whenever the final tick happened to be an outlier.
+  uint64_t parallelSum = 0;
+  uint64_t joinSum = 0;
+  uint64_t taskSum = 0;
+
   const auto start = std::chrono::steady_clock::now();
   for (int t = 0; t < ticks; ++t) {
     oneTick();
+    if (parallel) {
+      const MpParallel::ParallelMetrics& m = partOne.GetParallelMetrics();
+      parallelSum += m.lastParallelMicros;
+      joinSum += m.lastJoinMicros;
+      taskSum += m.lastAggregateTaskMicros;
+    }
   }
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
@@ -190,9 +213,11 @@ Sample RunScenario(int players, bool parallel, size_t workers, int ticks,
     sample.units = m.lastWorkUnitCount;
     sample.biggest = m.lastLargestClusterSize;
     sample.reportedSpeedup = m.GetLastSpeedup();
-    sample.parallelMicros = m.lastParallelMicros;
-    sample.joinMicros = m.lastJoinMicros;
-    sample.aggregateTaskMicros = m.lastAggregateTaskMicros;
+
+    const auto n = static_cast<uint64_t>(ticks);
+    sample.parallelMicros = parallelSum / n;
+    sample.joinMicros = joinSum / n;
+    sample.aggregateTaskMicros = taskSum / n;
   }
   return sample;
 }
@@ -204,7 +229,9 @@ TEST_CASE("Parallel offload throughput vs inline", "[.][ParallelBench]")
   // Extended past 150 to find the crossover: the offload only earns its
   // barrier overhead once the parallel phase is large enough to amortize it.
   const std::vector<int> populations = { 25, 50, 100, 150, 250, 400 };
-  constexpr int kTicks = 40;
+  // At 40 ticks the run-to-run spread on this machine was about 12%, wider
+  // than several of the effects being reported. 150 brings it under 3%.
+  constexpr int kTicks = 150;
 
   const size_t hw = std::thread::hardware_concurrency();
   std::printf("\n  hardware_concurrency = %zu\n", hw);
@@ -244,10 +271,16 @@ TEST_CASE("Parallel offload throughput vs inline", "[.][ParallelBench]")
                 static_cast<unsigned long long>(
                   parallelRun.aggregateTaskMicros));
 
-    // The crowd must have formed one cluster and been sharded, otherwise the
-    // benchmark is not measuring what it claims to.
+    // The crowd must have formed one cluster, otherwise the benchmark is not
+    // measuring what it claims to.
+    //
+    // Unit count is deliberately not asserted to be > 1. Shards are sized by
+    // estimated work, so a small population collapsing to a single unit -- and
+    // skipping the barrier entirely -- is the intended outcome, not a sign the
+    // benchmark stopped exercising sharding. The larger populations below do
+    // still shard, and the printed column shows it.
     REQUIRE(parallelRun.clusters == 1);
-    REQUIRE(parallelRun.units > 1);
+    REQUIRE(parallelRun.units >= 1);
   }
   std::printf("\n");
 }
@@ -258,7 +291,7 @@ TEST_CASE("Interest management: what cutting relays actually buys",
   // At 400 players the join emits 160k relays serially and dominates the
   // tick. Parallelising decisions cannot help that; sending less can. This
   // measures the only lever that attacks the N^2 term directly.
-  constexpr int kTicks = 30;
+  constexpr int kTicks = 150;
   std::printf("\n  relay volume vs tick cost, 400 players in one chunk\n\n");
   std::printf("  %-26s %10s %12s\n", "configuration", "relays", "us/tick");
   std::printf("  %s\n", std::string(52, '-').c_str());
@@ -314,26 +347,266 @@ TEST_CASE("Wire format ingest cost: binary vs legacy JSON",
   std::printf("\n");
 }
 
+TEST_CASE("Shard granularity: how small a work unit still pays",
+          "[.][ParallelBench]")
+{
+  // Shards are sized by estimated work rather than by actor count, and
+  // minShardMicros is the knob that says how small a piece is still worth
+  // handing to the scheduler. Too large and the tick never splits at all; too
+  // small and the batch is more dispatch than work. This is where the default
+  // comes from -- re-run it on the target hardware before changing it.
+  //
+  // More ticks than the other cases: the differences being resolved here are
+  // tens of microseconds on a few hundred, and at 40 ticks the run-to-run
+  // spread was wider than the effect.
+  constexpr int kTicks = 150;
+  std::printf("\n  us/tick by minShardMicros (0 = inline baseline)\n\n");
+  std::printf("  %-8s %10s", "players", "inline");
+  for (uint32_t m : { 8u, 12u, 20u, 30u, 60u }) {
+    std::printf(" %7uus", m);
+  }
+  std::printf("\n  %s\n", std::string(64, '-').c_str());
+
+  for (int players : { 50, 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("  %-8d %9.1f", players, baseline.perTickMicros);
+    for (uint32_t m : { 8u, 12u, 20u, 30u, 60u }) {
+      const Sample run =
+        RunScenario(players, true, 0, kTicks, false, false, m);
+      REQUIRE(run.relays == baseline.relays);
+      std::printf("  %5.1f/%-3zu", run.perTickMicros, run.units);
+    }
+    std::printf("\n");
+  }
+  std::printf("\n  (cell is us/tick and work-unit count)\n\n");
+}
+
+// One segment of a load profile: hold this many senders for this many ticks.
+struct LoadSegment
+{
+  int ticks = 0;
+  int activePlayers = 0;
+};
+
+// Drives a population that changes over time, which is what any setting tuned
+// once cannot follow.
+//
+// Every player stays connected throughout -- so the recipient set, and
+// therefore the per-sender work, is constant -- and only the number of them
+// sending movement each tick varies. That is the quantity the shard budget is
+// derived from, so it is what moves the optimum.
+//
+// Returns total wall clock for the whole profile, in microseconds. Totals
+// rather than per-tick averages because segments differ in length and the
+// question is which configuration finishes the whole shift faster.
+double RunLoadProfile(const std::vector<LoadSegment>& profile, int totalPlayers,
+                      bool parallel, const MpParallel::ParallelConfig& config)
+{
+  PartOne partOne;
+  NullSendTarget sendTarget;
+  partOne.SetSendTarget(&sendTarget);
+
+  if (parallel) {
+    partOne.ConfigureParallelism(config);
+  }
+
+  const int side = static_cast<int>(
+    std::ceil(std::sqrt(static_cast<double>(totalPlayers))));
+  const float spacing = 3800.f / static_cast<float>(std::max(side - 1, 1));
+  auto posX = [&](int i) { return static_cast<float>(i % side) * spacing; };
+  auto posY = [&](int i) { return static_cast<float>(i / side) * spacing; };
+
+  std::vector<uint32_t> idx(totalPlayers);
+  for (int i = 0; i < totalPlayers; ++i) {
+    DoConnect(partOne, static_cast<Networking::UserId>(i));
+    const uint32_t formId = 0xff000000 + static_cast<uint32_t>(i);
+    partOne.CreateActor(formId, { posX(i), posY(i), 0.f }, 0.f, 0x3c);
+    partOne.SetUserActor(static_cast<Networking::UserId>(i), formId);
+    idx[i] = dynamic_cast<MpActor*>(
+               partOne.worldState.LookupFormById(formId).get())
+               ->GetIdx();
+  }
+
+  auto oneTick = [&](int active) {
+    for (int i = 0; i < active; ++i) {
+      SendBinaryMovement(partOne, static_cast<Networking::UserId>(i), idx[i],
+                         posX(i) + 1.f, posY(i) + 1.f);
+    }
+    partOne.Tick();
+  };
+
+  // Warm up at the profile's first level so allocator growth and subscription
+  // setup are not charged to the measurement.
+  for (int w = 0; w < 10; ++w) {
+    oneTick(profile.empty() ? totalPlayers : profile.front().activePlayers);
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  for (const LoadSegment& segment : profile) {
+    for (int t = 0; t < segment.ticks; ++t) {
+      oneTick(segment.activePlayers);
+    }
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  return std::chrono::duration<double, std::micro>(elapsed).count();
+}
+
+TEST_CASE("Idle threads: does pool size cost anything on its own?",
+          "[.][ParallelBench]")
+{
+  // The question any adaptive width control turns on. If the number of workers
+  // *involved* in a tick is what matters, a controller can vary it per tick for
+  // free by capping the shard count -- surplus workers stay parked in the
+  // condition variable and cost nothing. If merely having the threads exist is
+  // what costs, then adapting width means destroying and respawning OS threads,
+  // which is far too expensive to do per tick.
+  //
+  // The unit count is pinned with maxShardsPerCluster so that only the pool
+  // size varies. Read each row against the 4-worker row: flat means idle
+  // threads are free.
+  constexpr int kTicks = 150;
+
+  for (int players : { 150, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("\n  %d players, unit count pinned, inline baseline %.1f us\n\n",
+                players, baseline.perTickMicros);
+    std::printf("  %-10s %10s %10s %10s\n", "pool size", "4 units", "8 units",
+                "16 units");
+    std::printf("  %s\n", std::string(46, '-').c_str());
+
+    for (size_t workers : { size_t(4), size_t(8), size_t(16), size_t(24) }) {
+      if (workers > std::thread::hardware_concurrency()) {
+        continue;
+      }
+      std::printf("  %-10zu", workers);
+      for (size_t units : { size_t(4), size_t(8), size_t(16) }) {
+        const Sample run =
+          RunScenario(players, true, workers, kTicks, false, false, 1, units);
+        REQUIRE(run.relays == baseline.relays);
+        std::printf(" %9.1f", run.perTickMicros);
+      }
+      std::printf("\n");
+    }
+  }
+  std::printf("\n");
+}
+
+TEST_CASE("A changing population moves the optimum", "[.][ParallelBench]")
+{
+  // The premise behind tuning anything at run time: no single fixed shard
+  // budget is best across a population that moves. If this prints a single
+  // column that wins every segment, adaptive tuning has nothing to chase and
+  // the fixed defaults should stay.
+  //
+  // The profile is a raid forming and dispersing: quiet, ramp, packed, ramp
+  // back down.
+  const std::vector<LoadSegment> profile = {
+    { 200, 40 },  { 150, 120 }, { 200, 300 },
+    { 300, 400 }, { 150, 120 }, { 200, 40 },
+  };
+
+  int totalTicks = 0;
+  for (const LoadSegment& s : profile) {
+    totalTicks += s.ticks;
+  }
+
+  std::printf("\n  one raid cycle (%d ticks, 40 -> 400 -> 40 senders)\n\n",
+              totalTicks);
+  std::printf("  %-16s %12s %10s\n", "maxShards", "total ms", "us/tick");
+  std::printf("  %s\n", std::string(42, '-').c_str());
+
+  double best = 0.0;
+  size_t bestShards = 0;
+  for (size_t shards : { size_t(2), size_t(4), size_t(8), size_t(16),
+                         size_t(32) }) {
+    MpParallel::ParallelConfig config = MakeConfig(0);
+    config.maxShardsPerCluster = shards;
+    config.minShardMicros = 1;
+    config.Normalize();
+
+    const double total = RunLoadProfile(profile, 400, true, config);
+    std::printf("  %-16zu %12.1f %10.1f\n", shards, total / 1000.0,
+                total / totalTicks);
+    if (best == 0.0 || total < best) {
+      best = total;
+      bestShards = shards;
+    }
+  }
+
+  MpParallel::ParallelConfig off;
+  off.enabled = false;
+  const double inlineTotal = RunLoadProfile(profile, 400, false, off);
+  std::printf("  %-16s %12.1f %10.1f\n", "inline", inlineTotal / 1000.0,
+              inlineTotal / totalTicks);
+  std::printf("\n  best fixed ceiling over the whole cycle: %zu shards\n\n",
+              bestShards);
+
+  REQUIRE(best > 0.0);
+}
+
+TEST_CASE("Cost of a wrong offload threshold, in both directions",
+          "[.][ParallelBench]")
+{
+  // minActorsToOffload is a break-even measured on one machine, so the useful
+  // question for anything that tunes it is how much it costs to be wrong --
+  // and whether the penalty is symmetric. If it is not, a controller should
+  // be biased toward the cheap side rather than trying to sit exactly on the
+  // boundary.
+  constexpr int kTicks = 150;
+  std::printf("\n  us/tick by minActorsToOffload\n\n");
+  std::printf("  %-8s %10s", "players", "inline");
+  for (size_t t : { size_t(1), size_t(100), size_t(300), size_t(100000) }) {
+    std::printf(" %9zu", t);
+  }
+  std::printf("\n  %s\n", std::string(58, '-').c_str());
+
+  for (int players : { 50, 100, 150, 250, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("  %-8d %9.1f", players, baseline.perTickMicros);
+
+    for (size_t threshold : { size_t(1), size_t(100), size_t(300),
+                              size_t(100000) }) {
+      MpParallel::ParallelConfig config = MakeConfig(0);
+      config.minActorsToOffload = threshold;
+      config.Normalize();
+      const double total =
+        RunLoadProfile({ { kTicks, players } }, players, true, config);
+      std::printf(" %9.1f", total / kTicks);
+    }
+    std::printf("\n");
+  }
+  // 100000 is "never offload": the snapshot is still built and the relay
+  // decisions still made, just on the calling thread. It isolates what the
+  // feature costs when the pool is switched off but the machinery is not.
+  std::printf("\n  (100000 = pool never engages; snapshot still built)\n\n");
+}
+
 TEST_CASE("Parallel offload scaling by worker count", "[.][ParallelBench]")
 {
-  constexpr int kPlayers = 150;
-  constexpr int kTicks = 40;
+  // This is where the auto-detect default comes from. More workers is not
+  // monotonically better: past the point where the shard budget can keep them
+  // fed, extra threads only add scheduling pressure and cross-core traffic on
+  // the output buffers the join has to read back.
+  constexpr int kTicks = 150;
 
-  const Sample baseline = RunScenario(kPlayers, false, 0, kTicks);
-  std::printf("\n  %d players, %d ticks, inline baseline = %.1f us/tick\n\n",
-              kPlayers, kTicks, baseline.perTickMicros);
-  std::printf("  %-8s %12s %9s\n", "workers", "us/tick", "speedup");
-  std::printf("  %s\n", std::string(34, '-').c_str());
+  for (int players : { 150, 400 }) {
+    const Sample baseline = RunScenario(players, false, 0, kTicks);
+    std::printf("\n  %d players, %d ticks, inline baseline = %.1f us/tick\n\n",
+                players, kTicks, baseline.perTickMicros);
+    std::printf("  %-8s %12s %9s %8s\n", "workers", "us/tick", "speedup",
+                "units");
+    std::printf("  %s\n", std::string(42, '-').c_str());
 
-  for (size_t workers : { size_t(1), size_t(2), size_t(4), size_t(8),
-                          size_t(16) }) {
-    if (workers > std::thread::hardware_concurrency()) {
-      continue;
+    for (size_t workers : { size_t(1), size_t(2), size_t(4), size_t(6),
+                            size_t(8), size_t(12), size_t(16), size_t(24) }) {
+      if (workers > std::thread::hardware_concurrency()) {
+        continue;
+      }
+      const Sample run = RunScenario(players, true, workers, kTicks);
+      REQUIRE(run.relays == baseline.relays);
+      std::printf("  %-8zu %12.1f %8.2fx %8zu\n", workers, run.perTickMicros,
+                  baseline.perTickMicros / run.perTickMicros, run.units);
     }
-    const Sample run = RunScenario(kPlayers, true, workers, kTicks);
-    REQUIRE(run.relays == baseline.relays);
-    std::printf("  %-8zu %12.1f %8.2fx\n", workers, run.perTickMicros,
-                baseline.perTickMicros / run.perTickMicros);
   }
   std::printf("\n");
 }

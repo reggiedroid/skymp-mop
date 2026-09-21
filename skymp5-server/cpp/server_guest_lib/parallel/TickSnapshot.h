@@ -73,6 +73,19 @@ struct RelayTarget
   int16_t chunkY = 0;
 };
 
+// Half-open range of `relayTargets` sharing one chunk.
+//
+// `relayTargets` is sorted by (worldOrCell, chunkX, chunkY), so every chunk's
+// occupants are contiguous. Workers search this table instead of the target
+// list: there is one entry per *occupied chunk* rather than one per player,
+// and a sender only ever asks about the nine chunks of its own stencil.
+struct RelayChunk
+{
+  AreaKey key;
+  uint32_t begin = 0;
+  uint32_t end = 0;
+};
+
 // Immutable-during-the-parallel-phase view of everything submitted this tick.
 //
 // The main thread fills this during ingest and join; workers only read it.
@@ -80,6 +93,9 @@ struct TickSnapshot
 {
   std::vector<ActorSnapshot> actors;
   std::vector<RelayTarget> relayTargets;
+
+  // Chunk index over `relayTargets`, rebuilt whenever that list is replaced.
+  std::vector<RelayChunk> relayChunks;
 
   // Raw packet payloads, concatenated. Relaying forwards these bytes
   // untouched, exactly as ActionListener::SendToNeighbours does, so the wire
@@ -93,6 +109,7 @@ struct TickSnapshot
   {
     actors.clear();
     relayTargets.clear();
+    relayChunks.clear();
     rawPacketBytes.clear();
   }
 

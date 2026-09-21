@@ -50,14 +50,24 @@ public:
     corrected.push_back(actor.formId);
   }
 
-  void SendRelay(Networking::UserId userId, const uint8_t* data, size_t length,
-                 bool reliable) override
+  void SendRelayBatch(const OutboundSend* sends, size_t count,
+                      const uint8_t* packetBytes,
+                      size_t packetBytesLength) override
   {
-    RecordedRelay relay;
-    relay.userId = userId;
-    relay.bytes.assign(data, data + length);
-    relay.reliable = reliable;
-    relays.push_back(relay);
+    for (size_t i = 0; i < count; ++i) {
+      const OutboundSend& send = sends[i];
+      if (send.byteLength == 0 ||
+          static_cast<size_t>(send.byteOffset) + send.byteLength >
+            packetBytesLength) {
+        continue;
+      }
+      RecordedRelay relay;
+      relay.userId = send.userId;
+      relay.bytes.assign(packetBytes + send.byteOffset,
+                         packetBytes + send.byteOffset + send.byteLength);
+      relay.reliable = send.reliable;
+      relays.push_back(relay);
+    }
   }
 
   std::vector<uint32_t> applied;
@@ -699,4 +709,175 @@ TEST_CASE("An empty tick is cheap and harmless", "[ParallelOffload]")
 
   REQUIRE(sink.relays.empty());
   REQUIRE(dispatcher.GetMetrics().totalTicks == 10);
+}
+
+TEST_CASE("Shards are sized by work, not by head count", "[ParallelOffload]")
+{
+  // Sizing by actor count produced 50 work units for 150 actors -- three
+  // actors each, far under what a scheduler round trip costs. The budget is
+  // now driven by the per-actor cost previous ticks actually took, so a tick
+  // whose total work is below one shard's worth must collapse to a single
+  // unit and skip the barrier entirely.
+  ParallelConfig config = MakeConfig(4, 1);
+  config.minShardActors = 1;
+  // Far above anything this population can produce, so the budget must clamp
+  // to one unit however many actors there are.
+  config.minShardMicros = 1000000;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 1, 2, 3, 4 };
+  std::vector<RelayTarget> targets;
+  for (int i = 0; i < 40; ++i) {
+    targets.push_back(MakeTarget(static_cast<Networking::UserId>(i),
+                                 0xff000000 + i, 10.f * i, 0.f));
+  }
+
+  // Two ticks: the first has no cost estimate yet, the second is sized from
+  // the first's measurement, which is what the budget is meant to use.
+  for (int tick = 0; tick < 2; ++tick) {
+    for (int i = 0; i < 40; ++i) {
+      REQUIRE(dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                       packet)));
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+
+  REQUIRE(dispatcher.GetMetrics().lastWorkUnitCount == 1);
+  // And it still did all the work: 40 senders, each relaying to all 40
+  // players sharing its chunk.
+  REQUIRE(dispatcher.GetMetrics().lastRelayEdgesEmitted == 40 * 40);
+}
+
+TEST_CASE("Shard count follows the measured cost", "[ParallelOffload]")
+{
+  // The complement of the case above: with a small enough minimum, the same
+  // population must be split rather than run as one unit.
+  ParallelConfig config = MakeConfig(4, 1);
+  config.minShardActors = 1;
+  config.minShardMicros = 1;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 1, 2, 3, 4 };
+  std::vector<RelayTarget> targets;
+  for (int i = 0; i < 60; ++i) {
+    targets.push_back(MakeTarget(static_cast<Networking::UserId>(i),
+                                 0xff000000 + i, 10.f * i, 0.f));
+  }
+
+  for (int tick = 0; tick < 3; ++tick) {
+    for (int i = 0; i < 60; ++i) {
+      REQUIRE(dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 10.f * i, 0.f,
+                       packet)));
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+
+  REQUIRE(dispatcher.GetMetrics().lastWorkUnitCount > 1);
+  REQUIRE(dispatcher.GetMetrics().lastRelayEdgesEmitted == 60 * 60);
+}
+
+TEST_CASE("Sharding is behaviour-neutral under the work-based budget",
+          "[ParallelOffload]")
+{
+  // Whatever the budget decides, the relays and the applied movements must be
+  // identical. This is the property that lets shard sizing be a pure
+  // performance knob.
+  const std::vector<uint8_t> packet{ 9, 8, 7 };
+  std::vector<RelayTarget> targets;
+  for (int i = 0; i < 30; ++i) {
+    targets.push_back(MakeTarget(static_cast<Networking::UserId>(i),
+                                 0xff000000 + i, 20.f * i, 0.f));
+  }
+
+  auto run = [&](uint32_t minShardMicros) {
+    ParallelConfig config = MakeConfig(4, 1);
+    config.minShardActors = 1;
+    config.minShardMicros = minShardMicros;
+    config.Normalize();
+
+    OffloadDispatcher dispatcher(config);
+    RecordingSink sink;
+    for (int tick = 0; tick < 3; ++tick) {
+      sink.relays.clear();
+      sink.applied.clear();
+      for (int i = 0; i < 30; ++i) {
+        REQUIRE(dispatcher.SubmitMovement(
+          MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                         static_cast<Networking::UserId>(i), 20.f * i, 0.f,
+                         packet)));
+      }
+      dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+      dispatcher.ExecuteTick(sink);
+    }
+    return sink;
+  };
+
+  const RecordingSink fine = run(1);
+  const RecordingSink coarse = run(1000000);
+
+  REQUIRE(fine.applied == coarse.applied);
+  REQUIRE(fine.relays.size() == coarse.relays.size());
+  for (size_t i = 0; i < fine.relays.size(); ++i) {
+    REQUIRE(fine.relays[i].userId == coarse.relays[i].userId);
+    REQUIRE(fine.relays[i].bytes == coarse.relays[i].bytes);
+  }
+}
+
+TEST_CASE("An inline tick does not charge a real area for the whole server",
+          "[ParallelOffload]")
+{
+  // Below minActorsToOffload the dispatcher fabricates one cluster covering
+  // everything and labels it with whichever area submitted first. Feeding
+  // that cost to the load balancer charged one arbitrary chunk for every
+  // actor on the map, and the next offloaded tick would open with that chunk
+  // apparently far over budget and start throttling players in it for no
+  // reason.
+  //
+  // Detected through the throttle it used to cause: with a tiny budget, a
+  // poisoned estimate makes the very next offloaded tick suppress relays.
+  ParallelConfig config = MakeConfig(2, 1000);
+  config.adaptiveThrottling = true;
+  config.targetTickBudgetMicros = 1;
+  config.minClusterActors = 1;
+  config.Normalize();
+
+  OffloadDispatcher dispatcher(config);
+  RecordingSink sink;
+
+  const std::vector<uint8_t> packet{ 4, 5, 6 };
+  std::vector<RelayTarget> targets;
+  for (int i = 0; i < 12; ++i) {
+    // Spread well past throttleDistanceUnits so pressure, if any were
+    // recorded, would actually bite.
+    targets.push_back(MakeTarget(static_cast<Networking::UserId>(i),
+                                 0xff000000 + i, 300.f * i, 0.f));
+  }
+
+  // Many inline ticks: minActorsToOffload is 1000 and there are 12 actors, so
+  // every one of these takes the non-offloaded path.
+  for (int tick = 0; tick < 40; ++tick) {
+    for (int i = 0; i < 12; ++i) {
+      REQUIRE(dispatcher.SubmitMovement(
+        MakeSubmission(0xff000000 + i, static_cast<uint32_t>(i),
+                       static_cast<Networking::UserId>(i), 300.f * i, 0.f,
+                       packet)));
+    }
+    dispatcher.SetPotentialTargets(std::vector<RelayTarget>(targets));
+    dispatcher.ExecuteTick(sink);
+  }
+
+  REQUIRE(dispatcher.GetMetrics().totalInlineTicks == 40);
+  REQUIRE(dispatcher.GetMetrics().totalRelayEdgesThrottled == 0);
 }

@@ -67,6 +67,18 @@ private:
   std::vector<uint32_t> unionRank;
   std::vector<uint32_t> clusterOfRoot;
   std::vector<uint32_t> clusterOfChunk;
+
+  // Chunk each actor occupies, filled while the distinct chunks are being
+  // discovered. Keeping it means the actor-to-cluster pass is a pair of array
+  // reads instead of a hash lookup per actor, which matters because that pass
+  // is the only one that is O(actors) rather than O(occupied chunks).
+  std::vector<uint32_t> actorChunkSlot;
+
+  // Permutation that takes first-seen chunk order to sorted order, and the
+  // buffer the sorted keys are built into.
+  std::vector<uint32_t> chunkOrder;
+  std::vector<uint32_t> chunkRemap;
+  std::vector<AreaKey> sortedChunkKeys;
 };
 
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "AreaCluster.h"
 #include "AreaPartitioner.h"
+#include "InterestManager.h"
 #include "LoadBalancer.h"
 #include "ParallelConfig.h"
 #include "ParallelMetrics.h"
@@ -12,6 +13,43 @@
 #include <vector>
 
 namespace MpParallel {
+
+namespace detail {
+
+// One step of the adaptive offload-threshold control loop, extracted as a
+// pure function.
+//
+// The loop it replaces was written inline in ExecuteTick and keyed on
+// wall-clock timings, which made it untestable on any machine and flaky on a
+// slow one. It shipped default-on and broke `Shard count follows the
+// measured cost` on a 2-core host. Separated out, every rule below is a
+// case in ParallelOffloadTest.cpp rather than a hope.
+struct AdaptiveTickInput
+{
+  // Whether the tick just measured actually used the pool.
+  bool offloaded = false;
+  // Wall clock of the fork/join phase, and the serial-equivalent work it
+  // distributed. The join is excluded from both: both paths pay it.
+  uint64_t parallelMicros = 0;
+  uint64_t aggregateTaskMicros = 0;
+  size_t actorCount = 0;
+  uint64_t tickIndex = 0;
+  // The operator's configured value, which is also the decay floor.
+  size_t configuredThreshold = 0;
+  float bias = 1.05f;
+  uint32_t decayTicks = 10;
+};
+
+struct AdaptiveState
+{
+  size_t threshold = 0;
+  size_t disappointingStreak = 0;
+};
+
+[[nodiscard]] AdaptiveState StepAdaptiveThreshold(AdaptiveState state,
+                                                  const AdaptiveTickInput& in);
+
+}
 
 // Everything ActionListener knows about one movement update, flattened into
 // plain data. The dispatcher copies what it needs, so nothing here has to
@@ -63,8 +101,21 @@ public:
   // update.
   virtual void SendCorrection(const ActorSnapshot& actor) = 0;
 
-  virtual void SendRelay(Networking::UserId userId, const uint8_t* data,
-                         size_t length, bool reliable) = 0;
+  // Hands over one work unit's relay list in one call.
+  //
+  // Per-edge rather than per-batch was the obvious shape and the wrong one:
+  // relaying is the N^2 term, so at 400 players in one area this was 160,000
+  // virtual calls a tick, each of which then re-resolved the send target --
+  // a pointer chase and a throw-if-null -- and re-checked the recipient's
+  // connection. All three are loop invariants, and a batched call is what
+  // lets the implementation hoist them.
+  //
+  // `sends` index into [packetBytes, packetBytes + packetBytesLength). The
+  // implementation must bounds-check them; a range that does not fit is a
+  // malformed submission and should be skipped, not clamped.
+  virtual void SendRelayBatch(const OutboundSend* sends, size_t count,
+                              const uint8_t* packetBytes,
+                              size_t packetBytesLength) = 0;
 };
 
 // Collects movement updates during packet ingest, processes them across the
@@ -105,6 +156,13 @@ public:
   // recipients without enumerating the $O(N^2)$ edges on the main thread.
   void SetPotentialTargets(std::vector<RelayTarget>&& targets);
 
+  // Allocation-free form of the above: the caller fills the returned (empty)
+  // buffer in place and then calls CommitPotentialTargets. Rebuilding the
+  // list is a per-tick job, so handing over a fresh vector every time meant a
+  // heap round trip per tick for no reason.
+  [[nodiscard]] std::vector<RelayTarget>& BeginPotentialTargets() noexcept;
+  void CommitPotentialTargets();
+
   [[nodiscard]] size_t GetPendingCount() const noexcept
   {
     return snapshot.actors.size();
@@ -134,6 +192,16 @@ public:
     return snapshot.tickIndex;
   }
 
+  // The threshold actually in force. Equal to config.minActorsToOffload
+  // unless adaptiveParallelism has raised it, which is a thing an operator
+  // reading the metrics line needs to be able to see. A server behaving
+  // like the feature is off, while the configured value says it should be
+  // on, is otherwise unexplainable from the outside.
+  [[nodiscard]] size_t GetEffectiveMinActorsToOffload() const noexcept
+  {
+    return currentMinActorsToOffload;
+  }
+
 private:
   // A contiguous slice of one cluster's members. The unit of scheduling.
   //
@@ -152,10 +220,24 @@ private:
   // allowSharding is false on the inline path, where splitting a cluster
   // would only add per-unit bookkeeping to work that runs serially anyway.
   void BuildWorkUnits(bool allowSharding);
+  // Raises or decays currentMinActorsToOffload from the tick just measured.
+  // Only called when config.adaptiveParallelism is set.
+  void UpdateAdaptiveThreshold();
   void RunUnits();
   void JoinResults(IOffloadSink& sink);
   void ResetPool();
-  [[nodiscard]] size_t ComputeShardCount(size_t clusterSize) const;
+  [[nodiscard]] size_t ComputeShardCount(size_t clusterSize,
+                                         size_t shardBudget) const;
+
+  // How many shards this tick's work is worth splitting into in total.
+  //
+  // Sizing shards by actor count alone produced 50 work units for 150 actors,
+  // three actors each: far below what a scheduler round trip costs, and the
+  // measured result was that more worker threads made the tick slower rather
+  // than faster. This sizes them by estimated *work* instead, from the
+  // per-actor cost the previous ticks actually took, so a quiet tick collapses
+  // to a single unit and skips the barrier entirely.
+  [[nodiscard]] size_t ComputeShardBudget() const;
 
   ParallelConfig config;
   std::unique_ptr<ThreadPool> pool;
@@ -188,8 +270,42 @@ private:
   // by their cluster's rank without a lookup per comparison.
   std::vector<uint32_t> clusterRank;
 
+  // Rebuilt once per tick and read by every task. Const for the whole
+  // parallel phase, like the snapshot itself.
+  InterestManager::InterestPolicy policy;
+
+  // Whether the most recent tick actually partitioned by area. On the inline
+  // path the "clusters" are one synthetic bucket holding the whole server, so
+  // its cost says nothing about any real area.
+  bool lastTickOffloaded = false;
+
   ParallelMetrics metrics;
   uint64_t lastFailedTaskCount = 0;
+
+  // Smoothed cost of processing one actor, in microseconds. Feeds the shard
+  // budget. Zero until the first tick has been measured, which is treated as
+  // "no estimate" rather than "free".
+  double microsPerActorEma = 0.0;
+
+  // Whether the pool has already been told this tick's batch is coming. The
+  // hint is worth sending once, on the first submission, which is as early as
+  // the fact is known.
+  bool poolPrimed = false;
+
+  // How many tasks the previous tick pooled, used as the size hint for the
+  // prime. Starts at 0 so the very first tick primes nothing and simply pays
+  // the wakeup.
+  size_t lastPooledUnitEstimate = 0;
+
+  // The offload threshold actually in force. Equal to
+  // config.minActorsToOffload unless adaptiveParallelism has raised it; it
+  // never decays below that value, so the controller can only ever be more
+  // conservative than the operator asked for.
+  size_t currentMinActorsToOffload = 0;
+
+  // How many ticks in a row the offload has failed the adaptiveBias test.
+  // Reset by any tick that passes it, and by a tick that did not offload.
+  size_t consecutiveDisappointingTicks = 0;
 };
 
 }

@@ -19,6 +19,7 @@
 #include "PacketParser.h"
 #include "PartOneOffloadSink.h"
 #include "parallel/AreaKey.h"
+#include "parallel/CellFormIdCache.h"
 #include "parallel/OffloadDispatcher.h"
 
 PartOneSendTargetWrapper::PartOneSendTargetWrapper(
@@ -103,6 +104,8 @@ struct PartOne::Impl
   // Always present, but does nothing until ConfigureParallelism turns it on.
   std::unique_ptr<MpParallel::OffloadDispatcher> offloadDispatcher;
   std::unique_ptr<PartOneOffloadSink> offloadSink;
+
+  MpParallel::CellFormIdCache cellFormIdCache;
 };
 
 PartOne::PartOne(Networking::ISendTarget* sendTarget)
@@ -165,7 +168,11 @@ void PartOne::Tick()
   // which is the order the inline path produced.
   if (pImpl->offloadDispatcher && pImpl->offloadSink) {
     if (pImpl->offloadDispatcher->IsEnabled()) {
-      std::vector<MpParallel::RelayTarget> potentialTargets;
+      // Filled in place: the dispatcher owns the buffer across ticks, so
+      // rebuilding the list every tick does not go near the allocator.
+      std::vector<MpParallel::RelayTarget>& potentialTargets =
+        pImpl->offloadDispatcher->BeginPotentialTargets();
+
       if (pImpl->offloadDispatcher->GetPendingCount() > 0) {
         for (size_t i = 0, n = serverState.maxConnectedId; i <= n; ++i) {
           Networking::UserId userId = static_cast<Networking::UserId>(i);
@@ -180,9 +187,10 @@ void PartOne::Tick()
             target.pos[0] = pos.x;
             target.pos[1] = pos.y;
             target.pos[2] = pos.z;
-            
+
             try {
-              target.worldOrCell = actor->GetCellOrWorld().ToFormId(worldState.espmFiles);
+              target.worldOrCell = ResolveCellOrWorldFormId(
+                actor->GetCellOrWorld());
             } catch (const std::exception&) {
               continue;
             }
@@ -192,8 +200,9 @@ void PartOne::Tick()
           }
         }
       }
-      pImpl->offloadDispatcher->SetPotentialTargets(std::move(potentialTargets));
+      pImpl->offloadDispatcher->CommitPotentialTargets();
     }
+    pImpl->offloadSink->BeginJoin();
     pImpl->offloadDispatcher->ExecuteTick(*pImpl->offloadSink);
   }
 
@@ -204,6 +213,11 @@ void PartOne::Tick()
 MpParallel::OffloadDispatcher& PartOne::GetOffloadDispatcher()
 {
   return *pImpl->offloadDispatcher;
+}
+
+uint32_t PartOne::ResolveCellOrWorldFormId(const FormDesc& cellOrWorld)
+{
+  return pImpl->cellFormIdCache.Resolve(cellOrWorld, worldState.espmFiles);
 }
 
 void PartOne::ConfigureParallelism(const MpParallel::ParallelConfig& config)

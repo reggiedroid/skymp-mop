@@ -8,7 +8,6 @@
 #include <simdjson.h>
 #include <slikenet/BitStream.h>
 #include <spdlog/spdlog.h>
-#include <stdexcept>
 
 namespace {
 void Serialize(const IMessageBase& message, SLNet::BitStream& outputStream)
@@ -115,33 +114,46 @@ MessageSerializer::MessageSerializer(
 void MessageSerializer::Serialize(const char* jsonContent,
                                   SLNet::BitStream& outputStream)
 {
-  // TODO(#2257): perf: think if JsValue should be used directly
+  const auto len = strlen(jsonContent);
 
-  simdjson::dom::parser sjParser;
-  // TODO(#2257): logging and write raw instead of throwing exception
-  auto parsedJson = sjParser.parse(jsonContent, strlen(jsonContent));
+  auto parsedJson = ScratchParser().parse(jsonContent, len);
+  if (parsedJson.error()) {
+    spdlog::warn("MessageSerializer::Serialize - JSON parse failed, writing "
+                 "raw ({} bytes)",
+                 len);
+    outputStream.Write(static_cast<uint8_t>(Networking::MinPacketId));
+    outputStream.Write(jsonContent, len);
+    return;
+  }
 
-  // TODO(#2257): logging and write raw instead of throwing exception
   auto tResult = parsedJson.get_object().at_key("t").get_uint64();
   if (auto err = tResult.error()) {
-    throw std::runtime_error(
-      fmt::format("failed to read 't' of a message, simdjson error: {}",
-                  simdjson::error_message(err)));
+    spdlog::warn(
+      "MessageSerializer::Serialize - failed to read 't', simdjson "
+      "error: {}, writing raw",
+      simdjson::error_message(err));
+    outputStream.Write(static_cast<uint8_t>(Networking::MinPacketId));
+    outputStream.Write(jsonContent, len);
+    return;
   }
 
   auto index = static_cast<size_t>(tResult.value_unsafe());
   if (index >= serializerFns.size()) {
-    // TODO(#2257): logging
+    spdlog::warn("MessageSerializer::Serialize - type index {} out of range "
+                 "(max {}), writing raw",
+                 index, serializerFns.size());
     outputStream.Write(static_cast<uint8_t>(Networking::MinPacketId));
-    outputStream.Write(jsonContent, strlen(jsonContent));
+    outputStream.Write(jsonContent, len);
     return;
   }
 
   auto serializerFn = serializerFns[index];
   if (!serializerFn) {
-    // TODO(#2257): logging
+    spdlog::warn("MessageSerializer::Serialize - no serializer registered for "
+                 "type index {}, writing raw",
+                 index);
     outputStream.Write(static_cast<uint8_t>(Networking::MinPacketId));
-    outputStream.Write(jsonContent, strlen(jsonContent));
+    outputStream.Write(jsonContent, len);
     return;
   }
 

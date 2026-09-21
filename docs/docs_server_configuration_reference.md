@@ -469,8 +469,10 @@ option list, how clusters are formed, and what to watch in the metrics.
   // ...
   "parallelism": {
     "enabled": true,
-    "workerThreads": 0, // 0 auto-detects: cores minus two
-    "minActorsToOffload": 24,
+    "workerThreads": 0, // 0 auto-detects: physical cores minus one, capped at 8
+    "minActorsToOffload": 100,
+    "adaptiveParallelism": false, // unmeasured; read the page above first
+    "interestManagement": true,
     "adaptiveThrottling": true
   }
   // ...

@@ -149,6 +149,12 @@ public:
   void ConfigureParallelism(const MpParallel::ParallelConfig& config);
   const MpParallel::ParallelMetrics& GetParallelMetrics() const;
 
+  // FormDesc::ToFormId walks the load order comparing plugin names, so the
+  // offload path -- which needs one per player per tick and one per movement
+  // packet -- goes through this memo instead. Throws exactly what ToFormId
+  // throws when the plugin is not loaded.
+  uint32_t ResolveCellOrWorldFormId(const FormDesc& cellOrWorld);
+
 private:
   void Init();
 
